@@ -1,11 +1,12 @@
-import { spawn } from "node:child_process";
+import { runProcess, shutdownProcesses } from "./run-script/process.js";
 import {
   createBashToolDefinition,
   type BashOperations,
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
+import { assertNoLegacyInvocation, resolvePowerShell7 } from "./run-script/powershell.js";
 
-const DEFAULT_POWERSHELL_EXECUTABLE = "pwsh.exe";
+
 const DEFAULT_TIMEOUT_SECONDS = 120;
 const MAX_TIMEOUT_MS = 2_147_483_647;
 const MAX_TIMEOUT_SECONDS = MAX_TIMEOUT_MS / 1000;
@@ -15,34 +16,14 @@ const POWERSHELL_ENCODING_PREFIX = [
   "$OutputEncoding = [Console]::OutputEncoding",
   "if ($null -eq $env:PYTHONUTF8) { $env:PYTHONUTF8 = '1' }",
   "if ($null -eq $env:PYTHONIOENCODING) { $env:PYTHONIOENCODING = 'utf-8' }",
-  "if (Test-Path variable:PSStyle) { $PSStyle.OutputRendering = 'PlainText' }",
+  "$ErrorActionPreference = 'Stop'",
+  "if ($null -ne $PSStyle) { $PSStyle.OutputRendering = 'PlainText' }",
 ].join("\n");
 
-function terminateProcessTree(child: ReturnType<typeof spawn>): void {
-  // exitCode is null for signal-killed processes too, so also consult `killed`
-  // to avoid running taskkill against an already-dead (possibly reused) PID.
-  if (!child.pid || child.exitCode !== null || child.killed) {
-    return;
-  }
-
-  const killer = spawn("taskkill.exe", ["/PID", String(child.pid), "/T", "/F"], {
-    windowsHide: true,
-    stdio: "ignore",
-  });
-
-  killer.once("error", () => {
-    child.kill();
-  });
-  killer.once("close", (code) => {
-    if (code !== 0 && child.exitCode === null) {
-      child.kill();
-    }
-  });
-}
 
 function createPowerShellOperations(): BashOperations {
   return {
-    exec(command, cwd, options) {
+    async exec(command, cwd, options) {
       if (options.signal?.aborted) {
         return Promise.reject(new Error("aborted"));
       }
@@ -56,85 +37,22 @@ function createPowerShellOperations(): BashOperations {
       }
 
       const env = options.env ?? process.env;
-      const executable = env.PI_POWERSHELL_EXE?.trim() || DEFAULT_POWERSHELL_EXECUTABLE;
+      const executable = await resolvePowerShell7(env, options.signal);
+      const usesWsl = await assertNoLegacyInvocation(command, executable, env, options.signal);
       const script = `${POWERSHELL_ENCODING_PREFIX}\n${command}`;
 
-      return new Promise<{ exitCode: number | null }>((resolve, reject) => {
-        const child = spawn(
-          executable,
-          ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
-          {
-            cwd,
-            env,
-            windowsHide: true,
-            stdio: ["ignore", "pipe", "pipe"],
-          },
-        );
-
-        let settled = false;
-        let timedOut = false;
-        let timer: NodeJS.Timeout | undefined;
-
-        const cleanup = () => {
-          if (timer) {
-            clearTimeout(timer);
-          }
-          options.signal?.removeEventListener("abort", onAbort);
-        };
-
-        const rejectOnce = (error: Error) => {
-          if (settled) {
-            return;
-          }
-          settled = true;
-          cleanup();
-          reject(error);
-        };
-
-        const onAbort = () => {
-          terminateProcessTree(child);
-        };
-
-        child.stdout.on("data", options.onData);
-        child.stderr.on("data", options.onData);
-
-        child.once("error", (error) => {
-          rejectOnce(error);
-        });
-
-        child.once("close", (code) => {
-          if (settled) {
-            return;
-          }
-          settled = true;
-          cleanup();
-
-          if (options.signal?.aborted) {
-            reject(new Error("aborted"));
-          } else if (timedOut) {
-            reject(new Error(`timeout:${timeoutSeconds}`));
-          } else {
-            resolve({ exitCode: code });
-          }
-        });
-
-        if (options.signal?.aborted) {
-          onAbort();
-        } else {
-          options.signal?.addEventListener("abort", onAbort, { once: true });
-        }
-
-        timer = setTimeout(() => {
-          timedOut = true;
-          terminateProcessTree(child);
-        }, timeoutSeconds * 1000);
-      });
+      const result = await runProcess(executable,
+        ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+        cwd, { env, signal: options.signal, timeoutMs: timeoutSeconds * 1000, onData: options.onData, windowsJob: !usesWsl });
+      if (result.timedOut) throw new Error(`timeout:${timeoutSeconds}`);
+      return { exitCode: result.exitCode };
     },
   };
 }
 
 export default function (pi: ExtensionAPI) {
   const operations = createPowerShellOperations();
+  pi.on("session_shutdown", () => shutdownProcesses());
 
   pi.on("session_start", (_event, ctx) => {
     const bashTool = createBashToolDefinition(ctx.cwd, { operations });
@@ -143,15 +61,16 @@ export default function (pi: ExtensionAPI) {
       ...bashTool,
       label: "PowerShell",
       description:
-        "Execute a PowerShell command on Windows using PowerShell 7 by default (override with PI_POWERSHELL_EXE). Output streams while running and is truncated to Pi's standard 2000-line/50KB limit; complete truncated output is saved to a temporary file. PowerShell uses UTF-8 plain-text output, and Python child processes receive UTF-8 defaults when their encoding environment variables are unset. The default timeout is 120 seconds.",
+        "Execute a PowerShell command on Windows using validated PowerShell Core 7+ (PI_POWERSHELL_EXE may select another Core 7+ binary, never 5.1). Explicit legacy PowerShell invocations are blocked using executable AST positions; dynamic invocation is not a sandboxed boundary. Output streams while running and is truncated to Pi's standard 2000-line/50KB limit; complete truncated output is saved to a temporary file. PowerShell uses UTF-8 plain-text output, and Python child processes receive UTF-8 defaults when their encoding environment variables are unset. The default timeout is 120 seconds. Ordinary Windows processes use a kill-on-close Job and the command waits for descendants; timeout/cancellation ends that Job. Direct WSL calls use client process-tree cleanup, which cannot guarantee termination of all Linux descendants.",
       promptSnippet:
         "Execute PowerShell commands on Windows (Get-ChildItem, Select-String, Remove-Item, git, npm, etc.)",
       promptGuidelines: [
-        "Use bash to run shell commands. On this Windows system, bash executes commands through PowerShell 7 by default.",
+        "Use bash to run shell commands. On this Windows system, bash executes commands through validated PowerShell Core 7+; Windows PowerShell 5.1 is unsupported.",
         "Use PowerShell syntax and cmdlets when shell behavior matters; common aliases such as ls, cat, rm, cp, mv, and mkdir are available.",
         "Use Get-ChildItem -Recurse for recursive file discovery and Select-String or rg for text search.",
         "Use Out-File or Set-Content when explicit output encoding is important.",
         "Python commands run through bash inherit UTF-8 defaults via PYTHONUTF8 and PYTHONIOENCODING when those variables are unset; override them only for an explicit compatibility requirement.",
+        "Non-terminating cmdlet errors stop the command with a failing exit code; pass an explicit -ErrorAction such as SilentlyContinue when partial results are intended.",
       ],
     });
   });

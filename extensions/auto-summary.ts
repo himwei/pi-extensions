@@ -3,12 +3,16 @@ import { join } from "node:path";
 import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import { complete } from "@earendil-works/pi-ai/compat";
 import {
+  BorderedLoader,
   buildSessionContext,
   convertToLlm,
   serializeConversation,
   type ExtensionAPI,
   type ExtensionCommandContext,
+  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
+
+import { providerCurrency, readUsageFact } from "./shared/usage.js";
 
 const MAX_FILENAME_BASE_LENGTH = 40;
 const MAX_GENERATED_OUTPUT_TOKENS = 16_384;
@@ -137,16 +141,9 @@ type SummaryMode =
 
 const parseMode = (args: string): SummaryMode => {
   const trimmed = args.trim();
-  if (trimmed === "--generate" || trimmed === "-g") {
-    return { mode: "generate" };
-  }
-  if (trimmed.startsWith("--generate ")) {
-    return { mode: "generate", instructions: trimmed.slice("--generate ".length).trim() || undefined };
-  }
-  if (trimmed.startsWith("-g ")) {
-    return { mode: "generate", instructions: trimmed.slice("-g ".length).trim() || undefined };
-  }
-  return { mode: "save", filename: trimmed || undefined };
+  // 无参数：直接保存最近一次助手回复；有参数：作为生成要求交给当前模型。
+  if (!trimmed) return { mode: "save" };
+  return { mode: "generate", instructions: trimmed };
 };
 
 const buildDocumentPrompt = (conversationText: string, instructions?: string): string =>
@@ -210,10 +207,22 @@ const pickModel = (ctx: ExtensionCommandContext): Model<any> | undefined => {
   return ctx.modelRegistry.find(sessionModel.provider, sessionModel.modelId);
 };
 
+export function recordSummaryUsage(pi: ExtensionAPI, model: Model<any>, response: AssistantMessage): void {
+  const fact = readUsageFact({ type: "summary-usage", provider: model.provider, model: model.id, usage: response.usage });
+  if (fact && (fact.usage.totalTokens > 0 || fact.usage.cost.total > 0)) {
+    pi.appendEntry("summary-usage", {
+      provider: model.provider, model: model.id, currency: providerCurrency(model.provider),
+      usage: fact.usage, outcome: response.stopReason,
+    });
+  }
+}
+
 const generateDocument = async (
   conversationText: string,
   instructions: string | undefined,
   ctx: ExtensionCommandContext,
+  pi: ExtensionAPI,
+  signal: AbortSignal,
 ): Promise<string | undefined> => {
   const model = pickModel(ctx);
   if (!model) {
@@ -258,10 +267,13 @@ const generateDocument = async (
       headers: auth.headers,
       env: auth.env,
       maxTokens,
+      signal,
     },
   );
 
-  if (response.stopReason === "error" || response.stopReason === "aborted") {
+  recordSummaryUsage(pi, model, response);
+  if (signal.aborted || response.stopReason === "aborted") return undefined;
+  if (response.stopReason === "error") {
     throw new Error(`模型生成失败（${response.stopReason}）：${response.errorMessage ?? "无错误详情"}`);
   }
 
@@ -276,10 +288,24 @@ const generateDocument = async (
 };
 
 export default function (pi: ExtensionAPI) {
+  let pending: AbortController | undefined;
+  pi.on("session_shutdown", () => pending?.abort());
+  const preventNavigation = (_event: unknown, ctx: ExtensionContext) => {
+    if (!pending) return undefined;
+    ctx.ui.notify("/summary 正在生成，请先等待或按 Esc 取消后再切换会话/分支", "warning");
+    return { cancel: true };
+  };
+  pi.on("session_before_switch", preventNavigation);
+  pi.on("session_before_fork", preventNavigation);
+  pi.on("session_before_tree", preventNavigation);
   pi.registerCommand("summary", {
-    description: "保存最近一次助手回复；使用 --generate [要求] 生成完整会话文档",
+    description: "无参数保存最近一次助手回复；/summary [要求] 用当前模型生成完整会话文档",
     handler: async (args, ctx) => {
       await ctx.waitForIdle();
+      if (pending) {
+        ctx.ui.notify("/summary 正在生成，请先等待或按 Esc 取消", "warning");
+        return;
+      }
 
       try {
         const requested = parseMode(args);
@@ -306,10 +332,33 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
-        const content = await generateDocument(conversationText, requested.instructions, ctx);
-        if (!content) {
-          return;
+        const controller = new AbortController();
+        pending = controller;
+        let content: string | undefined;
+        try {
+          if (ctx.mode === "tui") {
+            const result = await ctx.ui.custom<{ text?: string; error?: unknown }>((tui, theme, _keys, done) => {
+              const loader = new BorderedLoader(tui, theme, "生成会话文档（Esc 取消）");
+              loader.onAbort = () => controller.abort();
+              // Wait for cancellation settlement so billed partial usage is
+              // recorded before the command/session is allowed to move on.
+              void generateDocument(conversationText, requested.instructions, ctx, pi, controller.signal)
+                .then(text => done({ text }), error => done({ error }));
+              return loader;
+            });
+            if (result.error && !controller.signal.aborted) throw result.error;
+            content = result.text;
+          } else {
+            content = await generateDocument(conversationText, requested.instructions, ctx, pi, controller.signal);
+          }
+          if (controller.signal.aborted) {
+            ctx.ui.notify("/summary 已取消", "info");
+            return;
+          }
+        } finally {
+          pending = undefined;
         }
+        if (!content) return;
 
         const base = sanitizeFilenameBase(markdownHeading(content) || pi.getSessionName() || "会话文档");
         const filePath = await writeVersionedMarkdown(ctx.cwd, base, content);
