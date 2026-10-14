@@ -1,6 +1,6 @@
 # My Pi Extensions
 
-面向 [Pi](https://github.com/earendil-works/pi) 的两个扩展，以及当前 `~/.pi/agent/AGENTS.md` 规则文件的整理归档。
+面向 [Pi](https://github.com/earendil-works/pi) 的三个扩展，以及当前 `~/.pi/agent/AGENTS.md` 规则文件的整理归档。
 
 ## 包含内容
 
@@ -14,14 +14,20 @@
   - 在 Windows 上将 Pi 的 `bash` 工具和 `!` / `!!` 执行切换为经过验证的 PowerShell Core 7+（默认 `pwsh.exe`，可通过 `PI_POWERSHELL_EXE` 覆盖），Windows PowerShell 5.1 不受支持。
   - 对命令做 AST 解析，拦截以显式旧版 PowerShell 为目标的调用；输出为 UTF-8 纯文本流，非终止性 cmdlet 错误会使命令以失败退出码结束。
   - 普通 Windows 子进程由 kill-on-close Job 持有直到退出；直接以 WSL 为目标的调用使用客户端进程树清理。默认超时 120 秒；会话关闭时会等待在跑的命令结束。
+- `extensions/tps-status.ts`
+  - 在 TUI 中测量最近一条已完成助手回复的解码速度，通过 `ctx.ui.setStatus("tps", ...)` 发布到状态栏。
+  - 计时窗口为首个非空文本/思考增量（或带名称/参数的工具事件）到 `message_end`，排除首字延迟（TTFT）与工具执行时间。
+  - 只使用供应商上报的 `usage.output`；缺少 token 用量或首 token 观测时不显示，不用字符数或 `durationMs` 估算。
+  - 流式期间每 400ms 刷新一次临时值并标记 `~`；中止/出错/未完成的回复不显示。
+  - 会话开始、切换模型、助手消息开始时清除旧状态。
 - `agent/AGENTS.md`
   - 当前 `~/.pi/agent/AGENTS.md` 的归档副本，保留 Pi Agent 的规则、术语和扩展清单。
 - `extensions/AGENTS.md`
-  - 只适用于本仓库 `extensions/` 目录的精简规则文件，记录两个扩展的范围、修改约束和验证方式。
+  - 只适用于本仓库 `extensions/` 目录的精简规则文件，记录三个扩展的范围、修改约束和验证方式。
 
 ## 安装
 
-1. 将 `extensions/` 目录下的全部内容（两个扩展入口与支撑模块）复制到：
+1. 将 `extensions/` 目录下的全部内容（三个扩展入口与支撑模块）复制到：
 
    ```text
    ~/.pi/agent/extensions/
@@ -50,7 +56,7 @@
 - `--generate` 会调用当前活动模型，并可能产生 API 用量和费用；会话内容会发送给该模型。
 - 两种模式都只在当前工作目录创建新的 Markdown 文件。
 
-`powershell-bash` 不提供命令；它通过 `session_start` 和 `user_bash` 事件注册并接管 PowerShell 执行。
+`powershell-bash` 与 `tps-status` 不提供命令；前者通过 `session_start` 和 `user_bash` 事件接管 PowerShell 执行，后者监听消息事件并更新状态栏。
 
 ## 行为边界
 
@@ -74,6 +80,7 @@ tsc -p "$HOME\.pi\agent\extensions\tsconfig.json"
 1. 执行 `/summary test`，确认当前工作目录出现新的 `test-v1.md`（或下一个版本）。
 2. 执行 `/summary --generate`，确认使用当前模型生成版本化 Markdown 文件。
 3. 让 Pi 执行一个普通 PowerShell 命令，确认使用 PowerShell 输出；也可以设置 `PI_POWERSHELL_EXE` 验证可执行文件覆盖。
+4. 在 TUI 中完成一次普通回复，确认状态栏出现 `tps` 值；取消一次回复，确认不显示残值。
 
 ## 项目结构
 
@@ -83,6 +90,7 @@ pi-extensions/
 │  ├─ AGENTS.md
 │  ├─ auto-summary.ts
 │  ├─ powershell-bash.ts
+│  ├─ tps-status.ts
 │  ├─ run-script/
 │  │  ├─ process.ts
 │  │  ├─ powershell.ts
