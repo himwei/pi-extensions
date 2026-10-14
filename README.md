@@ -15,11 +15,9 @@
   - 对命令做 AST 解析，拦截以显式旧版 PowerShell 为目标的调用；输出为 UTF-8 纯文本流，非终止性 cmdlet 错误会使命令以失败退出码结束。
   - 普通 Windows 子进程由 kill-on-close Job 持有直到退出；直接以 WSL 为目标的调用使用客户端进程树清理。默认超时 120 秒；会话关闭时会等待在跑的命令结束。
 - `extensions/tps-status.ts`
+  > 实现对齐 [deepseek-harness](https://github.com/deepseek-ai/deepseek-harness)
   - 在 TUI 中测量最近一条已完成助手回复的解码速度，通过 `ctx.ui.setStatus("tps", ...)` 发布到状态栏。
   - 计时窗口为首个非空文本/思考增量（或带名称/参数的工具事件）到 `message_end`，排除首字延迟（TTFT）与工具执行时间。
-  - 只使用供应商上报的 `usage.output`；缺少 token 用量或首 token 观测时不显示，不用字符数或 `durationMs` 估算。
-  - 流式期间每 400ms 刷新一次临时值并标记 `~`；中止/出错/未完成的回复不显示。
-  - 会话开始、切换模型、助手消息开始时清除旧状态。
 - `agent/AGENTS.md`
   - 当前 `~/.pi/agent/AGENTS.md` 的归档副本，保留 Pi Agent 的规则、术语和扩展清单。
 - `extensions/AGENTS.md`
