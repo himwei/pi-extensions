@@ -37,6 +37,8 @@
 
 ## 安装
 
+前置要求：Pi（类型检查兼容 1.1.0 声明，开发与运行验证基于 1.2.0）、Node.js、PowerShell 7；`notify-dot` 的前台探测仅在 Windows Terminal 下生效。
+
 1. 将 `extensions/` 目录下的全部内容（六个扩展入口与支撑模块）复制到：
 
    ```text
