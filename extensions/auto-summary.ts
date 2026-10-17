@@ -136,7 +136,7 @@ const markdownHeading = (content: string): string | undefined => {
 };
 
 type SummaryMode =
-  | { mode: "save"; filename?: string }
+  | { mode: "save" }
   | { mode: "generate"; instructions?: string };
 
 const parseMode = (args: string): SummaryMode => {
@@ -318,7 +318,7 @@ export default function (pi: ExtensionAPI) {
           }
 
           const base = sanitizeFilenameBase(
-            requested.filename || markdownHeading(content) || pi.getSessionName() || "模型输出",
+            markdownHeading(content) || pi.getSessionName() || "模型输出",
           );
           const filePath = await writeVersionedMarkdown(ctx.cwd, base, content);
           ctx.ui.notify(`已保存最近一次助手回复：${filePath}`, "info");
