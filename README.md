@@ -5,8 +5,8 @@
 ## 包含内容
 
 - `extensions/auto-summary.ts`
-  - 注册 `/summary [filename]`：不调用模型，保存当前分支最近一条有文本的助手回复。
-  - 注册 `/summary --generate [instructions]`（也支持 `-g`）：使用当前模型把当前分支整理成完整 Markdown 文档。
+  - 注册 `/summary`（无参数）：不调用模型，保存当前分支最近一条有文本的助手回复；文件名自动取自回复标题或会话名。
+  - 注册 `/summary [instructions]`：使用当前模型把当前分支整理成完整 Markdown 文档，参数直接作为整理要求传给模型（无任何旗标，不存在 `--generate` 或 `-g`）。
   - 文件名经过 Windows 安全清理，并以 `-v1.md`、`-v2.md` 的版本形式创建，绝不覆盖已有文件。
   - 生成模式会对会话内容做有界截断，并在超过输入预算时保留开头和最近内容。
   - TUI 中可用 Esc 取消生成；生成结束前会阻塞会话/分支导航。即使回复失败或被取消，也会先记录有效的供应商用量，再决定是否写文档；汇总条目包含币种和结果。
@@ -69,8 +69,8 @@
 ## 使用
 
 ```text
-/summary [可选文件名]
-/summary --generate [可选整理要求]
+/summary
+/summary [可选整理要求]
 /anim [可选样式 comet|wave|chase|random]
 /n [可选名字]
 /websearch <query>
@@ -78,9 +78,9 @@
 /websearch status
 ```
 
-- 默认模式只保存最近一次助手文本回复，不产生新的模型请求。
-- `--generate` 会调用当前活动模型，并可能产生 API 用量和费用；会话内容会发送给该模型。
-- 两种模式都只在当前工作目录创建新的 Markdown 文件。
+- 无参数 `/summary` 只保存最近一次助手文本回复，不产生新的模型请求；文件名自动生成。
+- 带任意参数的 `/summary` 进入生成模式：参数就是整理要求，会调用当前活动模型，并可能产生 API 用量和费用；会话内容会发送给该模型。
+- 两种模式都只在当前工作目录创建新的版本化 Markdown 文件。
 - `/anim` 无参数弹出样式选择列表，带参数直接设值并持久化；`anim-compaction` 的动画在压缩时自动出现，无需命令。
 - `/n` 带名字直接设置；裸 `/n` 调用当前模型生成短名，可能产生 API 用量和费用。
 - `/websearch` 直接调用 DeepSeek Search API，按成功次数计费（见上方）；`web_search` / `web_fetch` 工具由模型按需调用，同样计费。
@@ -109,8 +109,8 @@ tsc -p "$HOME\.pi\agent\extensions\tsconfig.json"
 
 重新加载后，可手动验证：
 
-1. 执行 `/summary test`，确认当前工作目录出现新的 `test-v1.md`（或下一个版本）。
-2. 执行 `/summary --generate`，确认使用当前模型生成版本化 Markdown 文件。
+1. 执行 `/summary`，确认当前工作目录出现新的版本化 Markdown 文件（文件名自动生成）。
+2. 执行 `/summary 整理成要点清单`（任意整理要求），确认使用当前模型生成版本化 Markdown 文档。
 3. 让 Pi 执行一个普通 PowerShell 命令，确认使用 PowerShell 输出；也可以设置 `PI_POWERSHELL_EXE` 验证可执行文件覆盖。
 4. 在 TUI 中完成一次普通回复，确认状态栏出现 `tps` 值；取消一次回复，确认不显示残值。
 5. 执行 `/anim` 切换样式后触发 `/compact`，确认动画 widget 出现、耗时/消息数正常、Esc 可取消。
