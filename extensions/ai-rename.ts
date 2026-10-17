@@ -178,6 +178,10 @@ export default function aiRename(pi: ExtensionAPI) {
 		description: "无参数：按会话内容用当前模型起名；/n <名>：直接命名（/name <名> 亦可）",
 		handler: async (args, ctx) => {
 			await ctx.waitForIdle();
+			if (pending) {
+				ctx.ui.notify("/n 正在生成，请先等待完成后再运行命名命令", "warning");
+				return;
+			}
 
 			const explicit = cleanSessionName(args);
 			if (args.trim() && !explicit) {
@@ -212,19 +216,20 @@ export default function aiRename(pi: ExtensionAPI) {
 				ctx.ui.notify("/n 未找到当前模型，无法生成名字", "warning");
 				return;
 			}
-			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model as Model<any>);
-			if (!auth.ok) {
-				ctx.ui.notify(`/n 模型鉴权失败：${auth.error}`, "warning");
-				return;
-			}
-			if (!auth.apiKey) {
-				ctx.ui.notify(`/n 未找到 ${model.provider}/${model.id} 的 API key`, "warning");
-				return;
-			}
-
 			const controller = new AbortController();
 			pending = controller;
 			try {
+				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model as Model<any>);
+				if (controller.signal.aborted) return;
+				if (!auth.ok) {
+					ctx.ui.notify(`/n 模型鉴权失败：${auth.error}`, "warning");
+					return;
+				}
+				if (!auth.apiKey) {
+					ctx.ui.notify(`/n 未找到 ${model.provider}/${model.id} 的 API key`, "warning");
+					return;
+				}
+
 				ctx.ui.notify(`/n 正在用 ${model.provider}/${model.id} 生成名字...`, "info");
 
 				const response = await complete(

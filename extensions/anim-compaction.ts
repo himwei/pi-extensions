@@ -3,7 +3,7 @@
  *
  * 触发：session_before_compact（手动 /compact、阈值自动、溢出恢复）
  * 位置：编辑器上方 widget（aboveEditor），不抢键盘焦点，编辑器保留 Esc 取消压缩
- * 收尾：session_compact / session_compact_failed；agent_settled 与 session_start 兜底
+ * 收尾：session_compact / session_compact_failed；agent_settled、session_start 与 session_shutdown 兜底
  *
  * 切换方式：/anim 命令 —— 不带参数弹出选择列表，带参数直接设值；选择后持久化写回
  * settings.json（保留其他键，损坏时拒绝写入）。也可直接改 settings.json。
@@ -13,18 +13,37 @@
  *   "comet"  / "a" — 16 格彗星条（金→珊瑚→蓝→青拖尾）
  *   "wave"   / "f" — 均衡器波形（▁▂▃▄▅▆▇ 起伏右移，越高越暖）
  *   "chase"  / "g" — 8 点追逐（金色头部 + 渐隐拖尾）
- * 行内容：旋转指示符 + 动画 + Compacting context X.Xs · N msgs (esc to cancel)；
- * N 为真实待总结消息数（preparation.messagesToSummarize.length），时间金色高亮。
+ * 行内容：旋转指示符 + 动画 + 金色时间 + 暗淡消息数 + 蓝色 token 规模 + 暗淡原因
+ * （如 "40.6s · 71 msgs · 31.2k tok · auto"）——内置行已含 "Auto-compacting...
+ * (esc to cancel)"，不重复。消息数为真实待总结条数
+ * （preparation.messagesToSummarize.length），token 取 preparation.tokensBefore，
+ * 原因取 event.reason（manual 不标；threshold → auto；overflow → overflow）。
  *
  * 主题适配：按 ctx.ui.theme.appearance 选配色——暗色 = 亮色系，亮色 = 加深色系
  * 且"暗淡"用中灰（ESC[2m 在亮底发虚）。内置 "Auto-compacting..." 行保留不动。
  */
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import type { Component, TUI } from "@earendil-works/pi-tui";
+import { truncateToWidth, type Component, type TUI } from "@earendil-works/pi-tui";
+import {
+	agentSettingsPath,
+	chooseStyle,
+	parseStyle,
+	readStyleConfig,
+	saveStyleSetting,
+	type AnimStyle,
+	type FixedStyle,
+} from "./anim-compaction/settings.js";
+import { performance } from "node:perf_hooks";
+
+export {
+	agentSettingsPath,
+	chooseStyle,
+	parseStyle,
+	readStyleConfig,
+	saveStyleSetting,
+} from "./anim-compaction/settings.js";
+export type { AnimStyle, FixedStyle } from "./anim-compaction/settings.js";
 
 const WIDGET_KEY = "anim-compaction";
 const TICK_MS = 50;
@@ -35,68 +54,12 @@ const CHASE_DOTS = 8;
 const ROT = ["-", "\\", "|", "/"] as const;
 const LEVELS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"] as const;
 
-// ---------- 配置 ----------
-
-export type AnimStyle = "random" | "comet" | "wave" | "chase";
-export type FixedStyle = Exclude<AnimStyle, "random">;
-const STYLE_ALIASES: Record<string, FixedStyle> = { a: "comet", f: "wave", g: "chase" };
-
-/** 解析样式值；非法输入回退 random（画廊字母 a/f/g 也接受） */
-export function parseStyle(raw: unknown): AnimStyle {
-	const v = typeof raw === "string" ? raw.trim().toLowerCase() : "";
-	if (v === "random" || v === "comet" || v === "wave" || v === "chase") return v;
-	return STYLE_ALIASES[v] ?? "random";
-}
-
-export function agentSettingsPath(): string {
-	return join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "settings.json");
-}
-
-/** 样式优先级：PI_COMET_STYLE 环境变量 > settings.json `cometCompactionStyle` > random */
-export function readStyleConfig(envValue: string | undefined, settingsPath: string): AnimStyle {
-	if (envValue !== undefined && envValue.trim() !== "") return parseStyle(envValue);
-	try {
-		const raw: unknown = JSON.parse(readFileSync(settingsPath, "utf8"));
-		if (raw && typeof raw === "object" && "cometCompactionStyle" in raw) {
-			return parseStyle((raw as Record<string, unknown>).cometCompactionStyle);
-		}
-	} catch {
-		// 文件缺失或损坏 → 默认
-	}
-	return "random";
-}
-
-/** 把样式写回 settings.json（保留其他键）；文件损坏时拒绝写入以免破坏用户设置 */
-export function saveStyleSetting(style: AnimStyle, settingsPath: string): { ok: boolean; error?: string } {
-	let record: Record<string, unknown> = {};
-	if (existsSync(settingsPath)) {
-		try {
-			const raw: unknown = JSON.parse(readFileSync(settingsPath, "utf8"));
-			if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-				return { ok: false, error: "settings.json 不是 JSON 对象，已取消写入" };
-			}
-			record = raw as Record<string, unknown>;
-		} catch {
-			return { ok: false, error: "settings.json 解析失败，已取消写入以免破坏现有设置" };
-		}
-	}
-	record.cometCompactionStyle = style;
-	writeFileSync(settingsPath, JSON.stringify(record, null, 2) + "\n", "utf8");
-	return { ok: true };
-}
-
-/** random 时从三种动画里抽一个（rng 可注入便于测试） */
-export function chooseStyle(configured: AnimStyle, rng: () => number = Math.random): FixedStyle {
-	if (configured !== "random") return configured;
-	const pool: readonly FixedStyle[] = ["comet", "wave", "chase"];
-	return pool[Math.floor(rng() * pool.length) % pool.length] as FixedStyle;
-}
-
 // ---------- 主题适配配色 ----------
 
 export interface Palette {
 	dim: string;
 	gold: string;
+	accent: string; // 标签内数字用（token 规模）：暗色取蓝，亮色取深蓝
 	colors: readonly string[]; // 彗头 → 彗尾
 	reset: string;
 }
@@ -107,6 +70,7 @@ export function paletteFor(appearance: string | undefined): Palette {
 		return {
 			dim: "\x1b[38;2;110;110;110m",
 			gold: "\x1b[38;2;168;118;16m",
+			accent: "\x1b[38;2;28;102;140m",
 			colors: [
 				"\x1b[38;2;168;118;16m", // 琥珀
 				"\x1b[38;2;190;74;56m", // 砖红
@@ -119,6 +83,7 @@ export function paletteFor(appearance: string | undefined): Palette {
 	return {
 		dim: "\x1b[2m",
 		gold: "\x1b[38;2;241;190;88m",
+		accent: "\x1b[38;2;77;154;191m",
 		colors: [
 			"\x1b[38;2;241;190;88m", // gold
 			"\x1b[38;2;240;144;130m", // coral
@@ -174,7 +139,23 @@ export function chaseFrame(step: number, dots: number, pal: Palette): string {
 	return parts.join(" ");
 }
 
-/** 完整行：旋转指示符 + 动画 + 标签（时间金色、消息数真实、提示暗淡） */
+/** 压缩附加信息：token 规模与触发原因（manual 不显示原因段） */
+export interface CompactionInfo {
+	tokens?: number;
+	reason?: "manual" | "threshold" | "overflow";
+}
+
+/** token 数格式化：31240 → "31.2k"，990 → "990" */
+export function formatTokens(n: number): string {
+	return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
+}
+
+function fitLine(line: string, width: number, pal: Palette): string {
+	const clipped = truncateToWidth(line, Math.max(0, Math.floor(width)), "");
+	return clipped.endsWith(pal.reset) ? clipped : `${clipped}${pal.reset}`;
+}
+
+/** 完整行：旋转指示符 + 动画 + 标签（时间金色、消息数暗淡、token 蓝、原因暗淡） */
 export function overlayLine(
 	style: FixedStyle,
 	step: number,
@@ -182,23 +163,29 @@ export function overlayLine(
 	width: number,
 	msgCount: number,
 	pal: Palette,
+	info?: CompactionInfo,
 ): string {
 	const time = `${(Math.max(0, elapsedMs) / 1000).toFixed(1)}s`;
+	const tokSeg = info?.tokens !== undefined && info.tokens > 0 ? ` · ${formatTokens(info.tokens)} tok` : "";
+	const reasonSeg = info?.reason === "threshold" ? " · auto" : info?.reason === "overflow" ? " · overflow" : "";
 	const label =
-		`${pal.dim}Compacting context ${pal.reset}${pal.gold}${time}${pal.reset}` +
-		`${pal.dim} · ${msgCount} msgs (esc to cancel)${pal.reset}`;
+		`${pal.gold}${time}${pal.reset}${pal.dim} · ${msgCount} msgs` +
+		`${tokSeg ? `${pal.reset}${pal.accent}${tokSeg}` : ""}` +
+		`${reasonSeg ? `${pal.reset}${pal.dim}${reasonSeg}` : ""}${pal.reset}`;
 	const rot = ROT[((step % ROT.length) + ROT.length) % ROT.length] as string;
-	const labelVisible = 19 + time.length + ` · ${msgCount} msgs`.length + 16;
-	const budget = width - labelVisible - 6; // " " + rot + "  " + 动画 + "  "
-	if (budget < (style === "chase" ? CHASE_DOTS * 2 - 1 : MIN_BAR)) return ` ${rot}  ${label}`;
+	const labelVisible = time.length + ` · ${msgCount} msgs`.length + tokSeg.length + reasonSeg.length;
+	const pad = style === "chase" ? 3 : 2;
+	const budget = width - labelVisible - 4 - pad; // prefix + animation padding + label
+	if (budget < (style === "chase" ? CHASE_DOTS * 2 - 1 : MIN_BAR)) {
+		return fitLine(` ${rot}  ${label}`, width, pal);
+	}
 	const anim =
 		style === "wave"
 			? waveBar(step, Math.min(MAX_BAR, budget), pal)
 			: style === "chase"
 				? chaseFrame(step, CHASE_DOTS, pal)
 				: cometBar(step, Math.min(MAX_BAR, budget), pal);
-	const pad = style === "chase" ? 3 : 2;
-	return ` ${rot}  ${anim}${" ".repeat(pad)}${label}`;
+	return fitLine(` ${rot}  ${anim}${" ".repeat(pad)}${label}`, width, pal);
 }
 
 // ---------- 组件 ----------
@@ -209,15 +196,17 @@ class CometWidget implements Component {
 	private readonly appearance: string | undefined;
 	private readonly style: FixedStyle;
 	private readonly msgCount: number;
+	private readonly info: CompactionInfo;
 	private step = 0;
 	private timer: ReturnType<typeof setInterval> | null = null;
-	private readonly startedAt = Date.now();
+	private readonly startedAt = performance.now();
 
-	constructor(tui: TUI, appearance: string | undefined, style: FixedStyle, msgCount: number) {
+	constructor(tui: TUI, appearance: string | undefined, style: FixedStyle, msgCount: number, info: CompactionInfo) {
 		this.tui = tui;
 		this.appearance = appearance;
 		this.style = style;
 		this.msgCount = msgCount;
+		this.info = info;
 		this.timer = setInterval(() => {
 			this.step++;
 			this.tui.requestRender();
@@ -226,7 +215,15 @@ class CometWidget implements Component {
 
 	render(width: number): string[] {
 		return [
-			overlayLine(this.style, this.step, Date.now() - this.startedAt, width, this.msgCount, paletteFor(this.appearance)),
+			overlayLine(
+				this.style,
+				this.step,
+				performance.now() - this.startedAt,
+				width,
+				this.msgCount,
+				paletteFor(this.appearance),
+				this.info,
+			),
 		];
 	}
 
@@ -279,7 +276,7 @@ export function createCometCommand(
 				if (choice === undefined) return; // Esc 取消
 				picked = STYLE_MENU[options.indexOf(choice)]?.value ?? "random";
 			}
-			const result = saveStyleSetting(picked, settingsPath());
+			const result = await saveStyleSetting(picked, settingsPath());
 			if (!result.ok) {
 				ctx.ui.notify(result.error ?? "写入失败", "error");
 				return;
@@ -294,7 +291,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerCommand("anim", createCometCommand());
 
-	const start = (ctx: ExtensionContext, msgCount: number) => {
+	const start = (ctx: ExtensionContext, msgCount: number, info: CompactionInfo) => {
 		if (ctx.mode !== "tui" || shown) return;
 		shown = true;
 		const configured = readStyleConfig(process.env.PI_COMET_STYLE, agentSettingsPath());
@@ -303,7 +300,7 @@ export default function (pi: ExtensionAPI) {
 		// 工厂重载：组件自带定时器动画，随 widget 移除自动 dispose
 		ctx.ui.setWidget(
 			WIDGET_KEY,
-			(tui: TUI) => new CometWidget(tui, appearance, style, msgCount),
+			(tui: TUI) => new CometWidget(tui, appearance, style, msgCount, info),
 			{ placement: "aboveEditor" },
 		);
 	};
@@ -315,7 +312,11 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	pi.on("session_before_compact", async (event, ctx) => {
-		start(ctx, event.preparation?.messagesToSummarize?.length ?? 0);
+		const prep = event.preparation;
+		start(ctx, prep?.messagesToSummarize?.length ?? 0, {
+			tokens: prep?.tokensBefore,
+			reason: event.reason,
+		});
 	});
 	pi.on("session_compact", async (_event, ctx) => stop(ctx));
 	pi.on("session_compact_failed", async (_event, ctx) => stop(ctx));
@@ -323,4 +324,5 @@ export default function (pi: ExtensionAPI) {
 	// 会话切换时 pi 清空 widget，这里同步重置标记
 	pi.on("agent_settled", async (_event, ctx) => stop(ctx));
 	pi.on("session_start", async (_event, ctx) => stop(ctx));
+	pi.on("session_shutdown", async (_event, ctx) => stop(ctx));
 }

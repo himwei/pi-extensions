@@ -9,6 +9,14 @@
  * - Compaction never shows on its own: it only swaps the done glyph at the
  *   next settle, and only compactions during the run count (a manual
  *   `/compact` between turns does not).
+ * - Blocking UI prompts wait visibly: `ui_prompt_start` with kind "confirm"
+ *   (an authorization) marks 🔐 while other kinds mark ❓ — same away-only
+ *   gate — and `ui_prompt_end` drops the waiting marker.
+ * - Unseen markers keep priority ❌ > 🔐 > ❓ > ✅ > ●: a later, weaker settle
+ *   never overwrites a stronger one the user has not seen.
+ * - Probe answers are generation-guarded: input, a new submit, or shutdown
+ *   during an in-flight probe discards its result — no stale marker after
+ *   the user returns.
  * - The event marker clears on any terminal input, on the next submitted
  *   prompt (`before_agent_start`), and on shutdown; if ported terminals ever
  *   deliver DECSET 1004 focus reports, focus-in also clears it (we enable and
@@ -25,14 +33,14 @@
  * 3. Probe failure → keypress heuristic (`presenceTimeoutMs` fallback).
  *
  * Kill switch: `PI_NOTIFY_DOT=off`. Debug log: `PI_NOTIFY_DOT_DEBUG=1` writes
- * ~/.pi/agent/notify-dot-debug.log. `PI_NOTIFY_DOT_PROBE=present|away|unknown`
+ * notify-dot-debug.log under Pi's configured agent directory.
+ * `PI_NOTIFY_DOT_PROBE=present|away|unknown`
  * simulates the probe for tests and debugging.
  */
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { createPresenceProbe, type ProbeResult } from "./notify-dot/presence-probe.js";
 
 const CONFIG = {
 	/** Markers prefixed to the tab title. */
@@ -40,17 +48,25 @@ const CONFIG = {
 	/** Done glyph for a run that included a context compaction. */
 	markerDoneCompacted: "✅",
 	markerError: "❌",
+	/** Waiting glyphs for blocking UI prompts: authorization vs question. */
+	markerAuth: "🔐",
+	markerAsk: "❓",
 	/** Emit BEL when a marker is applied. */
 	bell: true,
 	/** Typing this recently means "present"; the probe is skipped. */
 	skipProbeIfInputYoungerMs: 3_000,
 	/** Heuristic fallback window when the probe cannot answer. */
 	presenceTimeoutMs: 8_000,
-	/** Foreground-probe result cache lifetime. */
-	probeCacheMs: 3_000,
-	/** Hard kill for the probe child before reporting "unknown". */
-	probeTimeoutMs: 4_000,
 } as const;
+
+/** Unseen-marker priority: a weaker settle never overwrites a stronger one. */
+const RANK: Record<string, number> = {
+	[CONFIG.markerError]: 4,
+	[CONFIG.markerAuth]: 3,
+	[CONFIG.markerAsk]: 2,
+	[CONFIG.markerDoneCompacted]: 1,
+	[CONFIG.markerDone]: 0,
+};
 
 const FOCUS_REPORT_ENABLE = "\x1b[?1004h";
 const FOCUS_REPORT_DISABLE = "\x1b[?1004l";
@@ -59,21 +75,12 @@ const FOCUS_OUT = "\x1b[O";
 const BEL = "\x07";
 /** Matches Pi's interactive title: APP_TITLE is "π" without a piConfigName. */
 const APP_TITLE = "π";
-const PROBE_SCRIPT = path.join(
-	os.homedir(),
-	".pi",
-	"agent",
-	"extensions",
-	"notify-dot",
-	"foreground-check.ps1",
-);
-const PWSH_FALLBACK = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
+const AGENT_DIR = getAgentDir();
 
 type Presence = "present" | "away" | "unknown";
-type ProbeResult = "present" | "away" | "unknown";
 
 const DEBUG = process.env.PI_NOTIFY_DOT_DEBUG === "1";
-const DEBUG_LOG = path.join(os.homedir(), ".pi", "agent", "notify-dot-debug.log");
+const DEBUG_LOG = path.join(AGENT_DIR, "notify-dot-debug.log");
 
 function debug(msg: string): void {
 	if (!DEBUG) return;
@@ -86,19 +93,6 @@ function debug(msg: string): void {
 
 const escapeSeq = (s: string): string => JSON.stringify(s.replace(/\x1b/g, "ESC"));
 
-function pwshBin(): string {
-	if (process.env.PI_POWERSHELL_EXE) return process.env.PI_POWERSHELL_EXE;
-	if (process.platform === "win32" && fs.existsSync(PWSH_FALLBACK)) return PWSH_FALLBACK;
-	return "pwsh";
-}
-
-function inWindowsTerminal(): boolean {
-	// Same identification oh-my-pi uses: WT_SESSION plus an optional TERM_PROGRAM
-	// cross-check. Avoids spawning the probe inside VSCode/conhost-style hosts.
-	if (process.env.WT_SESSION) return true;
-	return (process.env.TERM_PROGRAM ?? "").toLowerCase() === "windows_terminal";
-}
-
 function basename(p: string): string {
 	const parts = p.split(/[\\/]/).filter((part) => part.length > 0);
 	return parts.at(-1) ?? p;
@@ -106,7 +100,7 @@ function basename(p: string): string {
 
 /** Rebuild Pi's own base title so clearing a marker restores exactly it. */
 function baseTitle(ctx: ExtensionContext): string {
-	const cwdBase = basename(ctx.cwd);
+	const cwdBase = basename(ctx.sessionManager.getCwd());
 	const name = ctx.sessionManager.getSessionName();
 	return name ? `${APP_TITLE} - ${name} - ${cwdBase}` : `${APP_TITLE} - ${cwdBase}`;
 }
@@ -116,7 +110,7 @@ function baseTitle(ctx: ExtensionContext): string {
  * prefix: ` - <session> - <cwd>` when named, ` - <cwd>` otherwise.
  */
 function baseSuffix(ctx: ExtensionContext): string {
-	const cwdBase = basename(ctx.cwd);
+	const cwdBase = basename(ctx.sessionManager.getCwd());
 	const name = ctx.sessionManager.getSessionName();
 	return name ? ` - ${name} - ${cwdBase}` : ` - ${cwdBase}`;
 }
@@ -132,14 +126,20 @@ export default function notifyDot(pi: ExtensionAPI) {
 	/** True when a session_compact fired during the current run. */
 	let compacted = false;
 	let lastTurnErrored = false;
-	let hooked = false;
 	let focusModeEnabled = false;
 	let lastCtx: ExtensionContext | undefined;
+	let inputUi: ExtensionContext["ui"] | undefined;
 	let unsubInput: (() => void) | undefined;
-	let probeCache: { at: number; result: ProbeResult } | undefined;
-	let pwshBroken = false;
-	/** In-flight probe, killed on shutdown so it can never delay exit. */
-	let probeChild: ReturnType<typeof spawn> | undefined;
+	let sessionKey: string | undefined;
+	/** Bumped on interaction/submit/shutdown; older probe answers are discarded. */
+	let generation = 0;
+	const foregroundProbe = createPresenceProbe(debug);
+	let focusSequenceTail = "";
+
+	function invalidateProbe(): void {
+		generation++;
+		foregroundProbe.invalidate();
+	}
 
 	function writeStdout(data: string): void {
 		try {
@@ -152,6 +152,9 @@ export default function notifyDot(pi: ExtensionAPI) {
 
 	function applyMarker(marker: string): void {
 		if (!lastCtx || activeMarker === marker) return;
+		if (activeMarker !== undefined && RANK[marker] <= RANK[activeMarker]) {
+			return; // An unseen, stronger marker outranks this one.
+		}
 		activeMarker = marker;
 		debug(`applyMarker ${marker}`);
 		lastCtx.ui.setTitle(`${marker} ${baseTitle(lastCtx)}`);
@@ -164,64 +167,9 @@ export default function notifyDot(pi: ExtensionAPI) {
 		lastCtx.ui.setTitle(baseTitle(lastCtx));
 	}
 
-	/**
-	 * Ask the OS whether the foreground WT tab is this session. Async and
-	 * cache-backed so back-to-back decisions share one spawn.
-	 */
+	/** Ask the isolated probe service whether the foreground WT tab is this session. */
 	function probeForeground(cb: (result: ProbeResult) => void): void {
-		const sim = process.env.PI_NOTIFY_DOT_PROBE;
-		if (sim === "present" || sim === "away" || sim === "unknown") {
-			cb(sim);
-			return;
-		}
-		if (process.platform !== "win32" || pwshBroken || !inWindowsTerminal()) {
-			cb("unknown");
-			return;
-		}
-		if (probeCache && Date.now() - probeCache.at <= CONFIG.probeCacheMs) {
-			cb(probeCache.result);
-			return;
-		}
-		let settled = false;
-		const done = (result: ProbeResult): void => {
-			if (settled) return;
-			settled = true;
-			probeCache = { at: Date.now(), result };
-			debug(`probe ${result}`);
-			cb(result);
-		};
-		try {
-			const args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", PROBE_SCRIPT];
-			if (lastCtx) args.push("-ExpectedSuffix", baseSuffix(lastCtx));
-			const child = spawn(pwshBin(), args, {
-				windowsHide: true,
-				stdio: ["ignore", "pipe", "ignore"],
-			});
-			probeChild = child;
-			let out = "";
-			const timer = setTimeout(() => {
-				child.kill();
-				done("unknown");
-			}, CONFIG.probeTimeoutMs);
-			child.stdout?.on("data", (chunk) => {
-				out += chunk.toString("utf8");
-			});
-			child.on("error", (err) => {
-				clearTimeout(timer);
-				pwshBroken = true;
-				debug(`probe spawn error: ${err.message}`);
-				done("unknown");
-			});
-			child.on("close", () => {
-				clearTimeout(timer);
-				if (probeChild === child) probeChild = undefined;
-				const v = out.trim();
-				done(v === "present" || v === "away" ? v : "unknown");
-			});
-		} catch (err) {
-			debug(`probe exception: ${err instanceof Error ? err.message : String(err)}`);
-			done("unknown");
-		}
+		foregroundProbe.probe(lastCtx ? baseSuffix(lastCtx) : "", cb);
 	}
 
 	/** Decide whether the user is looking at this tab, then apply or clear. */
@@ -238,7 +186,9 @@ export default function notifyDot(pi: ExtensionAPI) {
 			clearMarker(); // The user just typed here: definitely present.
 			return;
 		}
+		const gen = generation;
 		probeForeground((result) => {
+			if (gen !== generation) return; // The world moved on mid-probe; discard.
 			if (result === "away") {
 				applyMarker(marker);
 				return;
@@ -257,53 +207,95 @@ export default function notifyDot(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Strip focus reports from the raw stream so the TUI never parses them.
+	 * Strip focus reports from the raw stream so the TUI never parses them,
+	 * including sequences split across input chunks.
 	 * Any surviving input proves the window is focused and clears the marker.
 	 */
 	function handleTerminalInput(data: string): { consume?: boolean; data?: string } | undefined {
 		let sawIn = false;
 		let sawOut = false;
-		if (data.includes(FOCUS_IN)) sawIn = true;
-		if (data.includes(FOCUS_OUT)) sawOut = true;
-		if (sawIn || sawOut) {
-			focusReported = true;
-			presence = sawIn && !sawOut ? "present" : sawOut && !sawIn ? "away" : presence;
+		let lastFocus: Presence | undefined;
+		let changed = focusSequenceTail !== "";
+		const combined = focusSequenceTail + data;
+		focusSequenceTail = "";
+		let rest = "";
+		for (let i = 0; i < combined.length;) {
+			const remaining = combined.slice(i);
+			if (remaining.startsWith(FOCUS_IN)) {
+				sawIn = true;
+				lastFocus = "present";
+				changed = true;
+				i += FOCUS_IN.length;
+				continue;
+			}
+			if (remaining.startsWith(FOCUS_OUT)) {
+				sawOut = true;
+				lastFocus = "away";
+				changed = true;
+				i += FOCUS_OUT.length;
+				continue;
+			}
+			if (
+				(remaining.length >= 2 && remaining.length < FOCUS_IN.length && FOCUS_IN.startsWith(remaining)) ||
+				(remaining.length >= 2 && remaining.length < FOCUS_OUT.length && FOCUS_OUT.startsWith(remaining))
+			) {
+				focusSequenceTail = remaining;
+				changed = true;
+				break;
+			}
+			rest += combined.charAt(i);
+			i++;
 		}
-		const rest = data.split(FOCUS_IN).join("").split(FOCUS_OUT).join("");
+		if (lastFocus !== undefined) {
+			focusReported = true;
+			presence = lastFocus;
+		}
 		const hasInput = rest.length > 0;
 		if (hasInput) {
 			presence = "present";
 			lastInputAt = Date.now();
 		}
+		if (sawIn || sawOut || hasInput || focusSequenceTail !== "") invalidateProbe();
 		if (presence === "present" && (sawIn || hasInput)) clearMarker();
 		debug(
 			`input ${escapeSeq(data.length > 120 ? `${data.slice(0, 120)}…` : data)} ` +
 				`→ sawIn=${sawIn} sawOut=${sawOut} presence=${presence} focusReported=${focusReported}`,
 		);
-		return rest === data ? undefined : { data: rest };
+		return changed ? { data: rest } : undefined;
 	}
 
 	/** Idempotent: hook raw input and enable focus reporting (TUI only). */
 	function ensureHooked(ctx: ExtensionContext): void {
 		if (ctx.mode !== "tui") return;
-		if (!hooked) {
-			hooked = true;
-			lastCtx = ctx;
+		const key = `${ctx.sessionManager.getSessionId()}\0${ctx.sessionManager.getCwd()}\0${ctx.sessionManager.getSessionName() ?? ""}`;
+		if (sessionKey !== undefined && sessionKey !== key) invalidateProbe();
+		sessionKey = key;
+		lastCtx = ctx;
+		if (inputUi !== ctx.ui) {
+			unsubInput?.();
+			unsubInput = undefined;
 			const off = ctx.ui.onTerminalInput(handleTerminalInput);
+			inputUi = ctx.ui;
 			if (typeof off === "function") unsubInput = off;
-			debug("hooked raw input, enabling 1004");
+			debug("hooked raw input");
 		}
-		writeStdout(FOCUS_REPORT_ENABLE);
-		focusModeEnabled = true;
+		if (!focusModeEnabled) {
+			debug("enabling 1004 focus reporting");
+			writeStdout(FOCUS_REPORT_ENABLE);
+			focusModeEnabled = true;
+		}
 	}
 
 	pi.on("session_start", (_event, ctx) => {
 		ensureHooked(ctx);
+		invalidateProbe();
+		clearMarker();
 	});
 	pi.on("before_agent_start", (_event, ctx) => {
 		ensureHooked(ctx);
 		// A new run means the user just submitted here: present, marker stale.
 		clearMarker();
+		invalidateProbe(); // A new run invalidates in-flight and cached answers.
 		lastTurnErrored = false;
 		// Only compactions during the run swap its done glyph; a manual
 		// /compact between turns must not.
@@ -333,6 +325,18 @@ export default function notifyDot(pi: ExtensionAPI) {
 		}`);
 		settleMarker(marker);
 	});
+	pi.on("ui_prompt_start", (event, ctx) => {
+		ensureHooked(ctx);
+		// The run is blocked on the user — a stronger attention need than
+		// completion, and agent_settled never fires for it.
+		const marker = event.kind === "confirm" ? CONFIG.markerAuth : CONFIG.markerAsk;
+		settleMarker(marker);
+	});
+	pi.on("ui_prompt_end", (_event, ctx) => {
+		ensureHooked(ctx);
+		// Drop only a waiting marker; an unseen ❌/✅/● must survive.
+		if (activeMarker === CONFIG.markerAuth || activeMarker === CONFIG.markerAsk) clearMarker();
+	});
 	pi.on("session_compact", (event) => {
 		// Never touches the title: it only swaps ● for ✅ at the next settle.
 		compacted = true;
@@ -340,23 +344,24 @@ export default function notifyDot(pi: ExtensionAPI) {
 	});
 	pi.on("session_shutdown", (event, ctx) => {
 		debug(`shutdown reason=${event.reason}`);
-		// Kill any in-flight probe first: a completion check must never delay
-		// process exit (the unref lesson from oh-my-pi's desktop-notify).
-		probeChild?.kill();
-		probeChild = undefined;
+		// Kill in-flight probe work before clearing the session state.
+		generation++;
+		foregroundProbe.dispose();
+		if (ctx.mode === "tui") lastCtx = ctx;
 		// Restore the terminal, then reset for the next runtime in this process.
 		if (activeMarker !== undefined && ctx.mode === "tui") clearMarker();
 		unsubInput?.();
 		unsubInput = undefined;
+		inputUi = undefined;
 		if (focusModeEnabled) writeStdout(FOCUS_REPORT_DISABLE);
-		hooked = false;
 		focusModeEnabled = false;
+		sessionKey = undefined;
 		focusReported = false;
 		presence = "unknown";
 		lastInputAt = undefined;
 		activeMarker = undefined;
 		compacted = false;
 		lastTurnErrored = false;
-		probeCache = undefined;
+		focusSequenceTail = "";
 	});
 }
