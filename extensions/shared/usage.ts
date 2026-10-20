@@ -1,54 +1,17 @@
-import { readFileSync, statSync } from "node:fs";
-import { homedir } from "node:os";
-import { join } from "node:path";
 import type { Usage } from "@earendil-works/pi-ai";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { amountInCny, type Currency } from "./currency.js";
+import { priceAmounts, readUsagePricing, USAGE_PRICING_ENTRY } from "./pricing.js";
+export { settingsUsdCnyRate, usdCnyRate, type Currency } from "./currency.js";
 
-/** Local relay prices are configured in CNY; all other attributed prices are USD. */
-const CNY_PROVIDERS = new Set(["new-api", "claude_kiro"]);
-export type Currency = "CNY" | "USD";
-export function providerCurrency(provider: string): Currency {
-  return CNY_PROVIDERS.has(provider) ? "CNY" : "USD";
-}
-const DEFAULT_USD_CNY_RATE = 6.67;
-
-/** Read `usdCnyRate` from a settings file (Pi preserves unknown top-level keys when
- * saving). Cached per file by mtime/size; absent, malformed, or invalid values are ignored. */
-const settingsRateCache = new Map<string, { mtimeMs: number; size: number; rate: number | undefined }>();
-function agentSettingsPath(): string {
-  return join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "settings.json");
-}
-export function settingsUsdCnyRate(path = agentSettingsPath()): number | undefined {
-  let stat: { mtimeMs: number; size: number };
-  try {
-    stat = statSync(path);
-  } catch {
-    return undefined;
-  }
-  const cached = settingsRateCache.get(path);
-  if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) return cached.rate;
-  let rate: number | undefined;
-  try {
-    const value = record(JSON.parse(readFileSync(path, "utf8")))?.usdCnyRate;
-    rate = typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
-  } catch {
-    rate = undefined;
-  }
-  settingsRateCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, rate });
-  return rate;
-}
-
-/** USD→CNY rate precedence: explicit argument > `USD_CNY_RATE` env > settings.json
- * `usdCnyRate` > built-in default. */
-export function usdCnyRate(configured?: number): number {
-  const override = configured ?? Number(process.env.USD_CNY_RATE);
-  if (Number.isFinite(override) && override > 0) return override;
-  return settingsUsdCnyRate() ?? DEFAULT_USD_CNY_RATE;
-}
+const LEGACY_CNY_PROVIDERS = new Set(["new-api", "claude_kiro"]);
+/** Only for records predating the USD schema marker. New records declare USD. */
+export const providerCurrency = (provider: string): Currency => LEGACY_CNY_PROVIDERS.has(provider) ? "CNY" : "USD";
+export const COST_SCHEMA_ENTRY = "cost-schema";
+export const EXTENSION_USAGE_ENTRY = "extension-usage";
 const record = (value: unknown): Record<string, unknown> | undefined =>
-  value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown> : undefined;
-const nonnegative = (value: unknown): number =>
-  typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+  value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+const nonnegative = (value: unknown): number => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
 
 export interface UsageFact {
   provider: string;
@@ -57,53 +20,101 @@ export interface UsageFact {
   currency?: Currency;
   conversation: boolean;
   kind: string;
+  eventId?: string;
+  source?: string;
+  /** Original CNY quotes plus the remaining native USD amount. */
+  amounts?: { usd: number; cny: number };
 }
 
-/** Read each persisted usage owner once. Streaming updates are not ledger entries.
- * Records without provider attribution (compaction, branch summary, nested tool
- * usage) follow Pi's dollar convention — the native footer also displays them
- * as dollars — and convert as USD. Legacy summary rows remain readable. */
-export function readUsageFact(value: unknown): UsageFact | undefined {
+/** Read a single owner. The session reader supplies the native currency after cutover. */
+export function readUsageFact(value: unknown, nativeCurrency?: Currency, annotation?: unknown): UsageFact | undefined {
   const entry = record(value);
   if (!entry) return undefined;
   let owner: Record<string, unknown> | undefined;
   let conversation = false;
+  let native = false;
   let kind = String(entry.type ?? "");
   if (entry.type === "message") {
     owner = record(entry.message);
     if (owner?.role !== "assistant" && owner?.role !== "toolResult") return undefined;
     conversation = owner.role === "assistant";
+    native = true;
     kind = String(owner.role);
-  } else if (entry.type === "custom" && entry.customType === "summary-usage") {
+  } else if (entry.type === "custom" && ["summary-usage", EXTENSION_USAGE_ENTRY].includes(String(entry.customType))) {
     owner = record(entry.data);
-    kind = "summary";
+    kind = entry.customType === "summary-usage" ? "summary" : String(owner?.kind ?? "extension");
+    if (entry.customType === EXTENSION_USAGE_ENTRY && (owner?.version !== 1 ||
+      typeof owner.id !== "string" || !owner.id || typeof owner.source !== "string" || !owner.source ||
+      !["USD", "CNY"].includes(String(owner.currency)))) return undefined;
   } else if (["usage", "summary-usage", "compaction", "branch_summary"].includes(kind)) {
     owner = entry;
+    native = kind !== "summary-usage";
     kind = typeof entry.kind === "string" ? entry.kind : kind;
   } else return undefined;
   const raw = record(owner?.usage);
-  if (!raw) return undefined;
-  const rawCost = record(raw.cost);
+  const expense = entry.customType === EXTENSION_USAGE_ENTRY && typeof owner?.amount === "number" &&
+    Number.isFinite(owner.amount) && owner.amount >= 0;
+  if (!raw && !expense) return undefined;
+  const rawCost = record(raw?.cost);
   const cost = {
     input: nonnegative(rawCost?.input), output: nonnegative(rawCost?.output),
     cacheRead: nonnegative(rawCost?.cacheRead), cacheWrite: nonnegative(rawCost?.cacheWrite),
-    total: nonnegative(rawCost?.total),
+    total: expense ? owner!.amount as number : nonnegative(rawCost?.total),
   };
-  const input = nonnegative(raw.input), output = nonnegative(raw.output);
-  const cacheRead = nonnegative(raw.cacheRead), cacheWrite = nonnegative(raw.cacheWrite);
+  const input = nonnegative(raw?.input), output = nonnegative(raw?.output);
+  const cacheRead = nonnegative(raw?.cacheRead), cacheWrite = nonnegative(raw?.cacheWrite);
   const provider = typeof owner?.provider === "string" ? owner.provider : "unknown";
   const model = typeof owner?.model === "string" ? owner.model : "unknown";
-  const explicitCurrency = owner?.currency;
-  const currency = explicitCurrency === "CNY" || explicitCurrency === "USD"
-    ? explicitCurrency : provider === "unknown" ? undefined : providerCurrency(provider);
+  const explicit = owner?.currency;
+  const pricing = !expense && raw ? readUsagePricing(raw, annotation) ?? readUsagePricing(raw) : undefined;
+  const currency = pricing ? "USD" : explicit === "CNY" || explicit === "USD" ? explicit
+    : native && nativeCurrency ? nativeCurrency : provider === "unknown" ? undefined : providerCurrency(provider);
+  const usage: Usage = { input, output, cacheRead, cacheWrite,
+    totalTokens: nonnegative(raw?.totalTokens) || input + output + cacheRead + cacheWrite,
+    reasoning: nonnegative(raw?.reasoning), ...(raw?.cacheWrite1h !== undefined ? { cacheWrite1h: nonnegative(raw.cacheWrite1h) } : {}), cost };
   return {
     provider, model, currency, conversation, kind,
-    usage: { input, output, cacheRead, cacheWrite,
-      totalTokens: nonnegative(raw.totalTokens) || input + output + cacheRead + cacheWrite,
-      reasoning: nonnegative(raw.reasoning), cost },
+    ...(entry.customType === EXTENSION_USAGE_ENTRY ? { eventId: owner!.id as string, source: owner!.source as string } : {}),
+    ...(pricing ? { amounts: priceAmounts(usage, pricing) } : {}),
+    usage,
   };
 }
 
-export function costInCny(fact: UsageFact, rate = usdCnyRate()): number {
-  return fact.currency === "CNY" ? fact.usage.cost.total : fact.usage.cost.total * rate;
+export function isUsdSchema(value: unknown): boolean {
+  const entry = record(value);
+  return entry?.type === "custom" && entry.customType === COST_SCHEMA_ENTRY && record(entry.data)?.version === 2;
 }
+
+/** One chronological session pass preserves legacy currency and deduplicates explicit event IDs. */
+export function* readSessionUsage(entries: readonly unknown[]): Generator<{ entry: unknown; fact: UsageFact }> {
+  let nativeCurrency: Currency | undefined;
+  const seen = new Set<string>();
+  // Summary metadata may be appended after its immutable native usage owner.
+  const annotations = new Map<string, unknown>();
+  for (const value of entries) {
+    const entry = record(value), data = record(entry?.data);
+    if (entry?.type === "custom" && entry.customType === USAGE_PRICING_ENTRY && data?.version === 1 &&
+      typeof data.ownerId === "string" && !annotations.has(data.ownerId)) annotations.set(data.ownerId, data.pricing);
+  }
+  for (const entry of entries) {
+    if (isUsdSchema(entry)) { nativeCurrency = "USD"; continue; }
+    const id = record(entry)?.id;
+    const fact = readUsageFact(entry, nativeCurrency, typeof id === "string" ? annotations.get(id) : undefined);
+    if (!fact) continue;
+    if (fact.eventId) {
+      const key = JSON.stringify([fact.source, fact.eventId]);
+      if (seen.has(key)) continue;
+      seen.add(key);
+    }
+    yield { entry, fact };
+  }
+}
+
+/** Append the boundary once, including print mode and reloads of legacy sessions. */
+export function ensureUsdSchema(pi: Pick<ExtensionAPI, "appendEntry">, ctx: Pick<ExtensionContext, "sessionManager">): void {
+  if (!ctx.sessionManager.getEntries().some(isUsdSchema)) pi.appendEntry(COST_SCHEMA_ENTRY, { version: 2, currency: "USD" });
+}
+
+export const costInCny = (fact: UsageFact, rate?: number): number => fact.amounts
+  ? fact.amounts.cny + amountInCny(fact.amounts.usd, "USD", rate)
+  : amountInCny(fact.usage.cost.total, fact.currency, rate);

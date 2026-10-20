@@ -11,8 +11,9 @@
  *   - /websearch status — billed calls, cache hits, estimated cost
  *
  * Session-scoped TTL cache dedupes exact repeats for free; billing counters are
- * per process (5 CNY / 1000 successful calls). Credentials come from
- * DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL or ~/.pi/agent/.env (see client.ts).
+ * per process (5 CNY / 1000 successful calls). The process-local daily quota
+ * resets on the local calendar date; restarts reset it too. Credentials come from
+ * web-search/.env, then pi's deepseek API-key credential (see client.ts).
  */
 import { Type } from "@earendil-works/pi-ai";
 import type { Component } from "@earendil-works/pi-tui";
@@ -20,11 +21,13 @@ import {
   AgentToolResult,
   defineTool,
   type ExtensionAPI,
-  type ExtensionCommandContext,
+  type ExtensionContext,
   type Theme,
   type ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
 import { ApiError, LimitError, PRICE_PER_CALL_CNY, SearchClient, type FetchResult, type SearchDetails } from "./web-search/client.js";
+import { commandRequest, showOverlay } from "./web-search/command-ui.js";
+import { recordExpense } from "./shared/billing.js";
 import {
   buildFetchLines,
   buildSearchLines,
@@ -64,20 +67,32 @@ type FetchErrDetails = { url: string; error: string };
 type SearchToolDetails = SearchDetails | SearchErrDetails;
 type FetchToolDetails = FetchDetails | FetchErrDetails;
 
-/** Full-screen overlay showing precomputed lines; Esc/Enter/q closes. */
-async function showOverlay(ctx: ExtensionCommandContext, lines: (theme: Theme, width: number) => string[], hint: string): Promise<void> {
-  await ctx.ui.custom<undefined>((_tui, theme, _kb, done) => ({
-    render: (width: number) => [...lines(theme, width), "", theme.fg("dim", ` ${hint}`)],
-    invalidate() {},
-    handleInput(data: string) {
-      if (data === "\x1b" || data === "\r" || data === "q") done(undefined);
-    },
-  }));
-}
-
-export default function webSearch(pi: ExtensionAPI) {
-  const client = new SearchClient();
+export default function webSearch(pi: ExtensionAPI, client = new SearchClient()) {
+  let lifecycle = new AbortController();
   let lastSearch: SearchDetails | null = null;
+  let context: ExtensionContext | undefined;
+  let ledgerError = false;
+  const subscribe = () => client.onCharge(charge => {
+    try {
+      recordExpense(pi, { id: charge.id, source: "web-search", kind: charge.kind,
+        amount: charge.amountCny, currency: "CNY", provider: "deepseek", model: "web-service" });
+    } catch {
+      ledgerError = true;
+      context?.ui.notify("web-search 费用写入失败，本次会话的费用统计可能不完整", "warning");
+    }
+  });
+  let unsubscribe: (() => void) | undefined = subscribe();
+  pi.on("session_start", (_event, ctx) => {
+    lifecycle.abort();
+    lifecycle = new AbortController();
+    context = ctx;
+    ledgerError = false;
+    unsubscribe ??= subscribe();
+    lastSearch = null;
+    client.clearCache();
+  });
+  pi.on("session_shutdown", () => { lifecycle.abort(); unsubscribe?.(); unsubscribe = undefined; });
+  const requestSignal = (signal?: AbortSignal) => signal ? AbortSignal.any([signal, lifecycle.signal]) : lifecycle.signal;
 
   pi.registerTool(
     defineTool({
@@ -115,9 +130,12 @@ export default function webSearch(pi: ExtensionAPI) {
         ),
       }),
 
-      async execute(_toolCallId, params): Promise<AgentToolResult<SearchToolDetails>> {
+      async execute(_toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<SearchToolDetails>> {
+        context = ctx;
+        const active = requestSignal(signal);
         try {
-          const details = await client.search(params.query, params.count ?? 5);
+          const details = await client.search(params.query, params.count ?? 5, active);
+          active.throwIfAborted();
           return {
             content: [{ type: "text", text: searchContent(details) }],
             details,
@@ -139,6 +157,7 @@ export default function webSearch(pi: ExtensionAPI) {
             },
           };
         } catch (e) {
+          active.throwIfAborted();
           const msg = errorMessage(e);
           return { content: [{ type: "text", text: msg }], details: { query: params.query, error: msg }, isError: true };
         }
@@ -167,6 +186,7 @@ export default function webSearch(pi: ExtensionAPI) {
       label: "Web Fetch",
       description:
         "Fetch one web page and return it as Markdown, 20,000 characters per call; pass offset to continue reading a truncated page. " +
+        "Pages are cached for 10 minutes in this session; continuation reads use the same page without another billed request while cached. " +
         "Only http/https without embedded credentials. Note: JavaScript-only pages (e.g. NVD detail views) and non-HTML endpoints (JSON feeds) often yield no content; prefer web_search for those.",
       promptSnippet: "fetch a web page as Markdown",
       annotations: { readOnlyHint: true, openWorldHint: true },
@@ -183,10 +203,13 @@ export default function webSearch(pi: ExtensionAPI) {
         truncated: Type.Boolean(),
       }),
 
-      async execute(_toolCallId, params): Promise<AgentToolResult<FetchToolDetails>> {
+      async execute(_toolCallId, params, signal, _onUpdate, ctx): Promise<AgentToolResult<FetchToolDetails>> {
+        context = ctx;
+        const active = requestSignal(signal);
         try {
           const offset = params.offset ?? 0;
-          const page: FetchResult & { costCny: number } = await client.fetchPage(params.url);
+          const page: FetchResult & { costCny: number } = await client.fetchPage(params.url, active);
+          active.throwIfAborted();
           const length = params.length ?? FETCH_PAGE_CHARS;
           const text = fetchContent(page, params.url, offset, length);
           const window = text.split("\n\n").slice(2).join("\n\n");
@@ -211,6 +234,7 @@ export default function webSearch(pi: ExtensionAPI) {
             },
           };
         } catch (e) {
+          active.throwIfAborted();
           const msg = errorMessage(e);
           return { content: [{ type: "text", text: msg }], details: { url: params.url, error: msg }, isError: true };
         }
@@ -239,13 +263,16 @@ export default function webSearch(pi: ExtensionAPI) {
   pi.registerCommand("websearch", {
     description: "DeepSeek web search: /websearch <query> | /websearch fetch <n|url> | /websearch status",
     handler: async (args, ctx) => {
+      context = ctx;
+      const active = lifecycle.signal;
       const argv = args.trim().split(/\s+/).filter(Boolean);
 
       if (argv.length === 0 || argv[0] === "status") {
         const s = client.stats();
         ctx.ui.notify(
-          `web-search · calls ${s.billed} (cache ${s.cacheHits}) · est ¥${(s.billed * PRICE_PER_CALL_CNY).toFixed(3)} · limit ${s.dailyLimit}/day` +
-            (s.lastError ? ` · ${s.lastError}` : ""),
+          `web-search · calls ${s.billed} (cache ${s.cacheHits}) · est ¥${(s.billed * PRICE_PER_CALL_CNY).toFixed(3)}` +
+            ` · today ${s.day}: ${s.dailyBilled}/${s.dailyLimit || "off"} (+${s.dailyPending} pending; quota resets on restart)` +
+            (s.lastError ? ` · ${s.lastError}` : "") + (ledgerError ? " · 费用记录失败，统计可能不完整" : ""),
           "info",
         );
         return;
@@ -268,7 +295,8 @@ export default function webSearch(pi: ExtensionAPI) {
           return;
         }
         try {
-          const page = await client.fetchPage(url);
+          const page = await commandRequest(ctx, active, "获取网页", signal => client.fetchPage(url, signal));
+          if (!page || active.aborted) return;
           const text = fetchContent(page, url, 0, FETCH_PAGE_CHARS * 2);
           const details: FetchDetails = {
             url,
@@ -279,8 +307,13 @@ export default function webSearch(pi: ExtensionAPI) {
             text: text.split("\n\n").slice(2).join("\n\n"),
             costCny: page.costCny,
           };
-          await showOverlay(ctx, (theme, width) => buildFetchLines(details, theme)(width), "Esc 关闭");
+          if (ctx.mode === "tui") {
+            await showOverlay(ctx, (theme, width) => buildFetchLines(details, theme)(width), "Esc 关闭", active);
+          } else {
+            ctx.ui.notify(text, "info");
+          }
         } catch (e) {
+          if (active.aborted) return;
           ctx.ui.notify(errorMessage(e), "error");
         }
         return;
@@ -289,19 +322,22 @@ export default function webSearch(pi: ExtensionAPI) {
       /* direct search */
       const query = argv.join(" ");
       try {
-        const details = await client.search(query, 5);
+        const details = await commandRequest(ctx, active, "搜索网页", signal => client.search(query, 5, signal));
+        if (!details || active.aborted) return;
         lastSearch = details;
         if (ctx.mode === "tui") {
           await showOverlay(
             ctx,
             (theme, width) => buildSearchLines(details, theme)(width),
             "Esc 关闭 · /websearch fetch <n> 取全文",
+            active,
           );
         } else {
           const top = details.results.slice(0, 3).map((r, i) => `${i + 1}. ${r.title} — ${r.url}`);
           ctx.ui.notify([`web_search "${query}" · ${details.results.length} 条`, ...top].join("\n"), "info");
         }
       } catch (e) {
+        if (active.aborted) return;
         ctx.ui.notify(errorMessage(e), "error");
       }
     },

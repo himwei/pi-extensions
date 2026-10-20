@@ -11,8 +11,12 @@
  * The API key is never included in errors, logs, or tool details.
  */
 import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { setTimeout as delay } from "node:timers/promises";
 import { readStoredCredential } from "@earendil-works/pi-coding-agent";
+import { ApiError, validateUrl, responseText, searchResults, fetchResult } from "./response.js";
+export { ApiError, validateUrl } from "./response.js";
 
 export const PRICE_PER_CALL_CNY = 0.005;
 const DEFAULT_BASE_URL = "https://api.deepseek.com";
@@ -22,6 +26,7 @@ const REQUEST_TIMEOUT_MS = 90_000;
 const RETRY_DELAYS_MS = [500, 1000];
 const CACHE_TTL_MS = 10 * 60_000;
 const CACHE_MAX_ENTRIES = 50;
+const CACHE_MAX_BYTES = 16 * 1024 * 1024;
 
 export interface SearchResult {
   rerank_score: number;
@@ -56,24 +61,16 @@ export interface ClientStats {
   retries: number;
   lastError: string | null;
   dailyLimit: number;
+  dailyBilled: number;
+  dailyPending: number;
+  day: string;
 }
-
-/** Error with the HTTP status so callers can branch on billing-relevant codes. */
-export class ApiError extends Error {
-  constructor(
-    readonly status: number,
-    message: string,
-    readonly requestId?: string,
-  ) {
-    super(message);
-    this.name = "ApiError";
-  }
-}
+export interface ServiceCharge { id: string; kind: "search" | "fetch"; amountCny: number }
 
 /** Daily call limit reached; the message is model- and user-facing. */
 export class LimitError extends Error {
   constructor(limit: number) {
-    super(`web-search daily limit reached (${limit} billed calls). Raise PI_WEBSEARCH_DAILY_LIMIT or retry tomorrow.`);
+    super(`web-search daily limit reached (${limit} billed or pending calls in this Pi process). Raise PI_WEBSEARCH_DAILY_LIMIT or retry tomorrow.`);
     this.name = "LimitError";
   }
 }
@@ -105,49 +102,44 @@ export function readExtEnvFile(): Record<string, string> {
   }
 }
 
-export function validateUrl(raw: string): URL {
-  if (raw.length > 8192) throw new ApiError(400, "URL exceeds 8192 characters");
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw new ApiError(400, `Invalid URL: ${raw.slice(0, 100)}`);
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new ApiError(400, `Only http/https URLs are supported: ${url.protocol}`);
-  }
-  if (url.username || url.password) {
-    throw new ApiError(400, "URLs with embedded credentials are not allowed");
-  }
-  return url;
-}
-
-/** TTL cache for exact query+count repeats; hits cost nothing. */
-export class SearchCache {
-  private map = new Map<string, { at: number; value: SearchDetails }>();
+/** Session cache with TTL, entry count and an approximate UTF-16 byte budget. */
+class TtlCache<T> {
+  private map = new Map<string, { at: number; value: T; bytes: number }>();
+  private bytes = 0;
   constructor(
     private ttlMs = CACHE_TTL_MS,
     private maxEntries = CACHE_MAX_ENTRIES,
     private now: () => number = Date.now,
   ) {}
 
-  get(key: string): SearchDetails | undefined {
+  get(key: string): T | undefined {
     const hit = this.map.get(key);
     if (!hit) return undefined;
-    if (this.now() - hit.at > this.ttlMs) {
+    if (this.now() - hit.at >= this.ttlMs) {
+      this.bytes -= hit.bytes;
       this.map.delete(key);
       return undefined;
     }
     return hit.value;
   }
 
-  set(key: string, value: SearchDetails): void {
-    this.map.set(key, { at: this.now(), value });
-    while (this.map.size > this.maxEntries) {
-      this.map.delete(this.map.keys().next().value as string);
+  set(key: string, value: T): void {
+    const bytes = JSON.stringify(value).length * 2 + key.length * 2;
+    if (bytes > CACHE_MAX_BYTES) return;
+    this.bytes -= this.map.get(key)?.bytes ?? 0;
+    this.map.delete(key);
+    this.map.set(key, { at: this.now(), value, bytes });
+    this.bytes += bytes;
+    while (this.map.size > this.maxEntries || this.bytes > CACHE_MAX_BYTES) {
+      const oldest = this.map.keys().next().value as string;
+      this.bytes -= this.map.get(oldest)!.bytes;
+      this.map.delete(oldest);
     }
   }
 }
+
+/** TTL cache for exact query+count repeats; hits cost nothing. */
+export class SearchCache extends TtlCache<SearchDetails> {}
 
 const statusMessage: Record<number, string> = {
   402: "DeepSeek account balance insufficient (402): top up at the DeepSeek platform, then retry.",
@@ -157,15 +149,6 @@ const statusMessage: Record<number, string> = {
 function isRetryable(status: number): boolean {
   return status === 408 || status === 429 || status >= 500;
 }
-
-const sleep = (ms: number, signal?: AbortSignal) =>
-  new Promise<void>((resolve, reject) => {
-    const t = setTimeout(resolve, ms);
-    signal?.addEventListener("abort", () => {
-      clearTimeout(t);
-      reject(signal.reason ?? new Error("aborted"));
-    }, { once: true });
-  });
 
 export interface ClientOptions {
   baseUrl?: string;
@@ -187,10 +170,13 @@ export class SearchClient {
   /** Where the active key came from: "file" | "auth.json". */
   readonly credentialSource: "file" | "auth.json" | undefined;
   private cache: SearchCache;
+  private pages: TtlCache<FetchResult>;
+  private daily?: { day: string; billed: number; pending: number };
   private billed = 0;
   private cacheHits = 0;
   private retries = 0;
   private lastError: string | null = null;
+  private chargeListeners = new Set<(charge: ServiceCharge) => void>();
 
   constructor(opts: ClientOptions = {}) {
     const env = resolveCredentials(opts.readCredential, opts.readEnvFile);
@@ -201,6 +187,7 @@ export class SearchClient {
     this.fetchImpl = opts.fetchImpl ?? fetch;
     this.now = opts.now ?? Date.now;
     this.cache = new SearchCache(CACHE_TTL_MS, CACHE_MAX_ENTRIES, this.now);
+    this.pages = new TtlCache(CACHE_TTL_MS, CACHE_MAX_ENTRIES, this.now);
     if (!this.apiKey) {
       this.lastError = "no API key: web-search/.env or a deepseek api_key credential in auth.json";
     }
@@ -209,100 +196,175 @@ export class SearchClient {
   readonly dailyLimit: number;
 
   stats(): ClientStats {
-    return { billed: this.billed, cacheHits: this.cacheHits, retries: this.retries, lastError: this.lastError, dailyLimit: this.dailyLimit };
+    const today = this.today();
+    return { billed: this.billed, cacheHits: this.cacheHits, retries: this.retries, lastError: this.lastError,
+      dailyLimit: this.dailyLimit, dailyBilled: today.billed, dailyPending: today.pending, day: today.day };
   }
 
-  private assertReady(): void {
-    if (!this.apiKey) throw new ApiError(401, `web-search is not configured: ${this.lastError}`);
-    if (this.dailyLimit > 0 && this.billed >= this.dailyLimit) throw new LimitError(this.dailyLimit);
+  clearCache(): void {
+    this.cache = new SearchCache(CACHE_TTL_MS, CACHE_MAX_ENTRIES, this.now);
+    this.pages = new TtlCache(CACHE_TTL_MS, CACHE_MAX_ENTRIES, this.now);
   }
-  private async request<T>(path: string, body: unknown, signal?: AbortSignal): Promise<T> {
-    let timeout: AbortSignal = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
-    if (signal) timeout = AbortSignal.any([timeout, signal]);
+
+  onCharge(listener: (charge: ServiceCharge) => void): () => void {
+    this.chargeListeners.add(listener);
+    return () => { this.chargeListeners.delete(listener); };
+  }
+
+  private charge(kind: ServiceCharge["kind"]): void {
+    this.billed++;
+    const charge = { id: randomUUID(), kind, amountCny: PRICE_PER_CALL_CNY };
+    for (const listener of this.chargeListeners) listener(charge);
+  }
+
+  private today() {
+    const date = new Date(this.now());
+    const day = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+    if (this.daily?.day !== day) this.daily = { day, billed: 0, pending: 0 };
+    return this.daily;
+  }
+
+  /** Reserve before dispatch so parallel misses cannot all pass the final slot. */
+  private reserve(): (charged: boolean) => void {
+    if (!this.apiKey) throw new ApiError(401, `web-search is not configured: ${this.lastError}`);
+    const bucket = this.today();
+    if (this.dailyLimit > 0 && bucket.billed + bucket.pending >= this.dailyLimit) throw new LimitError(this.dailyLimit);
+    bucket.pending++;
+    let settled = false;
+    return charged => {
+      if (settled) return;
+      settled = true;
+      bucket.pending--;
+      if (charged) bucket.billed++;
+    };
+  }
+  private async request(path: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
+    const deadline = AbortSignal.timeout(REQUEST_TIMEOUT_MS);
+    const requestSignal = signal ? AbortSignal.any([deadline, signal]) : deadline;
     let lastErr: ApiError = new ApiError(500, "unreachable");
-    for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
-      if (attempt > 0) await sleep(RETRY_DELAYS_MS[attempt - 1], signal);
-      let res: Response;
-      try {
-        res = await this.fetchImpl(`${this.baseUrl}${path}`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.apiKey}` },
-          body: JSON.stringify(body),
-          signal: timeout,
-        });
-      } catch (e) {
-        lastErr = new ApiError(504, `network error: ${(e as Error).message}`);
-        this.retries++;
-        continue;
+    try {
+      for (let attempt = 0; attempt <= RETRY_DELAYS_MS.length; attempt++) {
+        requestSignal.throwIfAborted();
+        if (attempt > 0) {
+          await delay(RETRY_DELAYS_MS[attempt - 1], undefined, { signal: requestSignal });
+          requestSignal.throwIfAborted();
+          this.retries++;
+        }
+        let res: Response;
+        try {
+          res = await this.fetchImpl(`${this.baseUrl}${path}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Authorization: `Bearer ${this.apiKey}` },
+            body: JSON.stringify(body),
+            signal: requestSignal,
+          });
+        } catch (e) {
+          requestSignal.throwIfAborted();
+          lastErr = new ApiError(504, `network error: ${(e as Error).message}`);
+          continue;
+        }
+        requestSignal.throwIfAborted();
+        const text = await responseText(res, requestSignal);
+        if (res.ok) {
+          let value: unknown;
+          try { value = JSON.parse(text); }
+          catch { throw new ApiError(502, "web-search response is not valid JSON"); }
+          requestSignal.throwIfAborted();
+          this.lastError = null;
+          return value;
+        }
+        requestSignal.throwIfAborted();
+        let message = text;
+        let requestId: string | undefined;
+        try {
+          const parsed = JSON.parse(text) as { error?: { message?: string; type?: string }; request_id?: string };
+          message = parsed.error?.message ?? message;
+          requestId = parsed.request_id;
+        } catch {
+          /* keep raw text */
+        }
+        lastErr = new ApiError(res.status, statusMessage[res.status] ?? `${message} (HTTP ${res.status})`, requestId);
+        if (!isRetryable(res.status)) break;
       }
-      if (res.ok) {
-        this.lastError = null;
-        return (await res.json()) as T;
+      this.lastError = lastErr.message;
+      throw lastErr;
+    } catch (error) {
+      // User/session cancellation is terminal, including while reading a body or backing off.
+      signal?.throwIfAborted();
+      if (deadline.aborted) {
+        const expired = new ApiError(504, "web-search request timed out");
+        this.lastError = expired.message;
+        throw expired;
       }
-      const text = await res.text();
-      let message = text;
-      let requestId: string | undefined;
-      try {
-        const parsed = JSON.parse(text) as { error?: { message?: string; type?: string }; request_id?: string };
-        message = parsed.error?.message ?? message;
-        requestId = parsed.request_id;
-      } catch {
-        /* keep raw text */
-      }
-      lastErr = new ApiError(res.status, statusMessage[res.status] ?? `${message} (HTTP ${res.status})`, requestId);
-      if (!isRetryable(res.status)) break;
-      this.retries++;
+      throw error;
     }
-    this.lastError = lastErr.message;
-    throw lastErr;
   }
 
   async search(query: string, count = 5, signal?: AbortSignal): Promise<SearchDetails> {
-    this.assertReady();
+    signal?.throwIfAborted();
     const key = `${count}\u0000${query}`;
-    const hit = this.cache.get(key);
+    const cache = this.cache;
+    const hit = cache.get(key);
     if (hit) {
       this.cacheHits++;
-      return { ...hit, cached: true, ms: 0 };
+      return { ...hit, cached: true, ms: 0, costCny: 0 };
     }
-    const t0 = this.now();
-    const body = await this.request<{ results?: SearchResult[] }>("/v1/tools/search", { query, count, need_content: false }, signal);
-    const results = body.results ?? [];
-    const details: SearchDetails = {
-      query,
-      count,
-      results,
-      mirrors: mirrorOf(results),
-      ms: this.now() - t0,
-      cached: false,
-      costCny: PRICE_PER_CALL_CNY,
-    };
-    if (results.length > 0) {
-      this.billed++;
-      this.cache.set(key, details);
-    }
-    return details;
+    const settle = this.reserve();
+    try {
+      const t0 = this.now();
+      const body = await this.request("/v1/tools/search", { query, count, need_content: false }, signal);
+      signal?.throwIfAborted();
+      const results = searchResults(body);
+      const details: SearchDetails = {
+        query,
+        count,
+        results,
+        mirrors: mirrorOf(results),
+        ms: this.now() - t0,
+        cached: false,
+        costCny: results.length ? PRICE_PER_CALL_CNY : 0,
+      };
+      if (results.length > 0) {
+        settle(true);
+        this.charge("search");
+        cache.set(key, details);
+      }
+      return details;
+    } finally { settle(false); }
   }
 
   async fetchPage(url: string, signal?: AbortSignal): Promise<FetchResult & { costCny: number }> {
-    this.assertReady();
+    signal?.throwIfAborted();
     validateUrl(url);
-    const body = await this.request<FetchResult>("/v1/tools/fetch", { url }, signal);
-    this.billed++;
-    return { ...body, costCny: PRICE_PER_CALL_CNY };
+    const cache = this.pages;
+    const hit = cache.get(url);
+    if (hit) { this.cacheHits++; return { ...hit, costCny: 0 }; }
+    const settle = this.reserve();
+    try {
+      const body = fetchResult(await this.request("/v1/tools/fetch", { url }, signal));
+      signal?.throwIfAborted();
+      const billable = body.content.trim().length > 0;
+      if (billable) {
+        settle(true);
+        this.charge("fetch");
+        cache.set(url, body);
+      }
+      return { ...body, costCny: billable ? PRICE_PER_CALL_CNY : 0 };
+    } finally { settle(false); }
   }
 }
 
 /**
  * Page identity for mirror detection: `exec(3)`, `exec.3`, and `.../man3/exec.3`
- * all reduce to `exec#3`; different hosts without an identity pattern are never
- * merged.
+ * all reduce to `exec#3`; ordinary pages match only by URL (excluding fragment).
  */
 export function pageIdentity(r: { title: string; url: string }): string {
   const t = `${r.title} ${r.url}`;
   const m = t.match(/([a-z0-9_+-]{2,})\((\d[a-z]?)\)/i) ?? t.match(/\/?([a-z0-9_+-]{2,})\.(\d[a-z]?)(?:[.\s/#]|$)/i);
   if (m) return `${m[1].toLowerCase()}#${m[2]}`;
-  return `host:${new URL(r.url).hostname}`;
+  const url = new URL(r.url);
+  url.hash = "";
+  return `url:${url.href}`;
 }
 
 /** mirrors[i] = 1-based first-seen index of the same identity, 0 when unique. */

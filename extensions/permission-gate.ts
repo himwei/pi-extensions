@@ -37,7 +37,7 @@ function hasStringProperty<K extends string>(value: unknown, key: K): value is R
   );
 }
 
-/** Shared by bash's tool-call hook and run-script after capturing its source snapshot.
+/** Shared by bash/powershell tool-call hooks and run-script after capturing its source snapshot.
  * This is a high-confidence heuristic, not a sandbox or recursive dependency scanner. */
 export async function authorizeShellCommand(
   command: string,
@@ -155,7 +155,7 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
-    if (!isToolCallEventType("bash", event) || !hasStringProperty(event.input, "command")) {
+    if (!(isToolCallEventType("bash", event) || isToolCallEventType("powershell", event)) || !hasStringProperty(event.input, "command")) {
       return undefined;
     }
 

@@ -12,7 +12,7 @@
  * and carries both modes.
  *
  * The model call mirrors auto-summary's pattern (session's own model and key,
- * billed via the shared "summary-usage" fact) but feeds a topic digest
+ * billed via the shared "extension-usage" fact) but feeds a topic digest
  * instead of the full transcript: all user messages plus the AI's first text
  * reply — intent lives in the questions, and the recency bias of a tail-heavy
  * excerpt made names describe only the last thing that happened.
@@ -20,16 +20,12 @@
  * Bonus: notify-dot matches its WT tab by the ` - <session> - <cwd>` title
  * suffix, so a named session also makes same-directory tabs distinguishable.
  */
-import { complete } from "@earendil-works/pi-ai/compat";
-import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
 import {
 	buildSessionContext,
 	type ExtensionAPI,
-	type ExtensionCommandContext,
-	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
-import { recordSummaryUsage } from "./auto-summary.js";
+import { assistantText, commandModel, commandOperation, completeCommand } from "./shared/model-call.js";
 
 const MAX_NAME_CHARS = 40;
 const MAX_OUTPUT_TOKENS = 64;
@@ -37,12 +33,6 @@ const MAX_OUTPUT_TOKENS = 64;
 const MAX_INPUT_CHARS = 200;
 const MAX_INPUTS = 30; // beyond this: first 15 + last 15, middle omitted
 const MAX_REPLY_CHARS = 600;
-
-const extractAssistantText = (message: AssistantMessage): string =>
-	message.content
-		.filter((part): part is { type: "text"; text: string } => part.type === "text")
-		.map((part) => part.text)
-		.join("\n");
 
 /** Keep the head (goal) plus most of the tail (what actually happened). */
 export interface TopicDigest {
@@ -154,31 +144,14 @@ export function dropSlashCommandMessages(messages: unknown[]): unknown[] {
 	});
 }
 
-const pickModel = (
-	ctx: ExtensionCommandContext,
-	sessionModelId: { provider: string; modelId: string } | null | undefined,
-) =>
-	ctx.model ??
-	(sessionModelId ? ctx.modelRegistry.find(sessionModelId.provider, sessionModelId.modelId) : undefined);
-
 export default function aiRename(pi: ExtensionAPI) {
-	let pending: AbortController | undefined;
-	pi.on("session_shutdown", () => pending?.abort());
-	// A rename racing a session switch would land on the wrong session.
-	const preventNavigation = (_event: unknown, ctx: ExtensionContext) => {
-		if (!pending) return undefined;
-		ctx.ui.notify("/n 正在生成，请等待完成后再切换会话/分支", "warning");
-		return { cancel: true };
-	};
-	pi.on("session_before_switch", preventNavigation);
-	pi.on("session_before_fork", preventNavigation);
-	pi.on("session_before_tree", preventNavigation);
+	const operation = commandOperation(pi, "/n 正在生成，请等待完成后再切换会话/分支");
 
 	pi.registerCommand("n", {
 		description: "无参数：按会话内容用当前模型起名；/n <名>：直接命名（/name <名> 亦可）",
 		handler: async (args, ctx) => {
 			await ctx.waitForIdle();
-			if (pending) {
+			if (operation.isPending()) {
 				ctx.ui.notify("/n 正在生成，请先等待完成后再运行命名命令", "warning");
 				return;
 			}
@@ -211,48 +184,17 @@ export default function aiRename(pi: ExtensionAPI) {
 				return;
 			}
 
-			const model = pickModel(ctx, sessionContext.model);
+			const model = commandModel(ctx, sessionContext.model);
 			if (!model) {
 				ctx.ui.notify("/n 未找到当前模型，无法生成名字", "warning");
 				return;
 			}
-			const controller = new AbortController();
-			pending = controller;
+			const controller = operation.begin();
 			try {
-				const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model as Model<any>);
-				if (controller.signal.aborted) return;
-				if (!auth.ok) {
-					ctx.ui.notify(`/n 模型鉴权失败：${auth.error}`, "warning");
-					return;
-				}
-				if (!auth.apiKey) {
-					ctx.ui.notify(`/n 未找到 ${model.provider}/${model.id} 的 API key`, "warning");
-					return;
-				}
-
 				ctx.ui.notify(`/n 正在用 ${model.provider}/${model.id} 生成名字...`, "info");
 
-				const response = await complete(
-					model,
-					{
-						messages: [
-							{
-								role: "user" as const,
-								content: [{ type: "text" as const, text: buildRenamePrompt(digest) }],
-								timestamp: Date.now(),
-							},
-						],
-					},
-					{
-						apiKey: auth.apiKey,
-						headers: auth.headers,
-						env: auth.env,
-						maxTokens: Math.max(1, Math.min(MAX_OUTPUT_TOKENS, model.maxTokens ?? MAX_OUTPUT_TOKENS)),
-						signal: controller.signal,
-					},
-				);
-
-				recordSummaryUsage(pi, model, response);
+				const response = await completeCommand(pi, ctx.modelRegistry, model, buildRenamePrompt(digest),
+					Math.max(1, Math.min(MAX_OUTPUT_TOKENS, model.maxTokens ?? MAX_OUTPUT_TOKENS)), controller.signal, "ai-rename");
 				if (controller.signal.aborted || response.stopReason === "aborted") {
 					ctx.ui.notify("/n 已取消", "info");
 					return;
@@ -262,15 +204,18 @@ export default function aiRename(pi: ExtensionAPI) {
 					return;
 				}
 
-				const name = cleanSessionName(extractAssistantText(response));
+				const name = cleanSessionName(assistantText(response));
 				if (!name) {
 					ctx.ui.notify("/n 模型没有返回可用的名字", "error");
 					return;
 				}
 				pi.setSessionName(name);
 				ctx.ui.notify(`已命名会话：${name}`, "info");
+			} catch (error) {
+				if (controller.signal.aborted) ctx.ui.notify("/n 已取消", "info");
+				else ctx.ui.notify(`/n 失败：${error instanceof Error ? error.message : String(error)}`, "error");
 			} finally {
-				pending = undefined;
+				operation.finish(controller);
 			}
 		},
 	});

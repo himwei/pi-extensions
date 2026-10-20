@@ -1,7 +1,6 @@
 import { readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { AssistantMessage, Model } from "@earendil-works/pi-ai";
-import { complete } from "@earendil-works/pi-ai/compat";
+import type { Model } from "@earendil-works/pi-ai";
 import {
   BorderedLoader,
   buildSessionContext,
@@ -9,10 +8,10 @@ import {
   serializeConversation,
   type ExtensionAPI,
   type ExtensionCommandContext,
-  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 
-import { providerCurrency, readUsageFact } from "./shared/usage.js";
+import { assistantText, commandModel, commandOperation, completeCommand } from "./shared/model-call.js";
+export { recordSummaryUsage } from "./shared/model-call.js";
 
 const MAX_FILENAME_BASE_LENGTH = 40;
 const MAX_GENERATED_OUTPUT_TOKENS = 16_384;
@@ -106,12 +105,6 @@ const writeVersionedMarkdown = async (dir: string, base: string, content: string
   throw new Error("无法分配可用的 Markdown 文件版本号");
 };
 
-const extractAssistantText = (message: AssistantMessage): string =>
-  message.content
-    .filter((part): part is { type: "text"; text: string } => part.type === "text")
-    .map((part) => part.text)
-    .join("\n");
-
 const findLatestAssistantText = (ctx: ExtensionCommandContext): string | undefined => {
   const sessionContext = buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId());
 
@@ -121,7 +114,7 @@ const findLatestAssistantText = (ctx: ExtensionCommandContext): string | undefin
       continue;
     }
 
-    const text = extractAssistantText(message);
+    const text = assistantText(message);
     if (text.trim()) {
       return text.trimEnd();
     }
@@ -194,29 +187,6 @@ const prepareConversation = (conversationText: string, model: Model<any>, output
   };
 };
 
-const pickModel = (ctx: ExtensionCommandContext): Model<any> | undefined => {
-  if (ctx.model) {
-    return ctx.model;
-  }
-
-  const sessionModel = buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId()).model;
-  if (!sessionModel) {
-    return undefined;
-  }
-
-  return ctx.modelRegistry.find(sessionModel.provider, sessionModel.modelId);
-};
-
-export function recordSummaryUsage(pi: ExtensionAPI, model: Model<any>, response: AssistantMessage): void {
-  const fact = readUsageFact({ type: "summary-usage", provider: model.provider, model: model.id, usage: response.usage });
-  if (fact && (fact.usage.totalTokens > 0 || fact.usage.cost.total > 0)) {
-    pi.appendEntry("summary-usage", {
-      provider: model.provider, model: model.id, currency: providerCurrency(model.provider),
-      usage: fact.usage, outcome: response.stopReason,
-    });
-  }
-}
-
 const generateDocument = async (
   conversationText: string,
   instructions: string | undefined,
@@ -224,19 +194,9 @@ const generateDocument = async (
   pi: ExtensionAPI,
   signal: AbortSignal,
 ): Promise<string | undefined> => {
-  const model = pickModel(ctx);
+  const model = commandModel(ctx);
   if (!model) {
     ctx.ui.notify("/summary 未找到当前模型，无法生成文档", "warning");
-    return undefined;
-  }
-
-  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok) {
-    ctx.ui.notify(`/summary 模型鉴权失败：${auth.error}`, "warning");
-    return undefined;
-  }
-  if (!auth.apiKey) {
-    ctx.ui.notify(`/summary 未找到 ${model.provider}/${model.id} 的 API key`, "warning");
     return undefined;
   }
 
@@ -251,33 +211,13 @@ const generateDocument = async (
 
   ctx.ui.notify(`/summary 正在使用 ${model.provider}/${model.id} 生成完整 Markdown 文档...`, "info");
 
-  const response = await complete(
-    model,
-    {
-      messages: [
-        {
-          role: "user" as const,
-          content: [{ type: "text" as const, text: buildDocumentPrompt(prepared.text, instructions) }],
-          timestamp: Date.now(),
-        },
-      ],
-    },
-    {
-      apiKey: auth.apiKey,
-      headers: auth.headers,
-      env: auth.env,
-      maxTokens,
-      signal,
-    },
-  );
-
-  recordSummaryUsage(pi, model, response);
+  const response = await completeCommand(pi, ctx.modelRegistry, model, buildDocumentPrompt(prepared.text, instructions), maxTokens, signal);
   if (signal.aborted || response.stopReason === "aborted") return undefined;
   if (response.stopReason === "error") {
     throw new Error(`模型生成失败（${response.stopReason}）：${response.errorMessage ?? "无错误详情"}`);
   }
 
-  const text = extractAssistantText(response).trim();
+  const text = assistantText(response).trim();
   if (!text) {
     throw new Error("当前模型没有返回可保存的 Markdown 文本");
   }
@@ -288,21 +228,12 @@ const generateDocument = async (
 };
 
 export default function (pi: ExtensionAPI) {
-  let pending: AbortController | undefined;
-  pi.on("session_shutdown", () => pending?.abort());
-  const preventNavigation = (_event: unknown, ctx: ExtensionContext) => {
-    if (!pending) return undefined;
-    ctx.ui.notify("/summary 正在生成，请先等待或按 Esc 取消后再切换会话/分支", "warning");
-    return { cancel: true };
-  };
-  pi.on("session_before_switch", preventNavigation);
-  pi.on("session_before_fork", preventNavigation);
-  pi.on("session_before_tree", preventNavigation);
+  const operation = commandOperation(pi, "/summary 正在生成，请先等待或按 Esc 取消后再切换会话/分支");
   pi.registerCommand("summary", {
     description: "无参数保存最近一次助手回复；/summary [要求] 用当前模型生成完整会话文档",
     handler: async (args, ctx) => {
       await ctx.waitForIdle();
-      if (pending) {
+      if (operation.isPending()) {
         ctx.ui.notify("/summary 正在生成，请先等待或按 Esc 取消", "warning");
         return;
       }
@@ -332,8 +263,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
 
-        const controller = new AbortController();
-        pending = controller;
+        const controller = operation.begin();
         let content: string | undefined;
         try {
           if (ctx.mode === "tui") {
@@ -355,8 +285,12 @@ export default function (pi: ExtensionAPI) {
             ctx.ui.notify("/summary 已取消", "info");
             return;
           }
+        } catch (error) {
+          if (!controller.signal.aborted) throw error;
+          ctx.ui.notify("/summary 已取消", "info");
+          return;
         } finally {
-          pending = undefined;
+          operation.finish(controller);
         }
         if (!content) return;
 
