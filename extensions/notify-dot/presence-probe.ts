@@ -1,11 +1,10 @@
 import { spawn } from "node:child_process";
 import * as fs from "node:fs";
-import * as path from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import { fileURLToPath } from "node:url";
 
 export type ProbeResult = "present" | "away" | "unknown";
 
-const PROBE_SCRIPT = path.join(getAgentDir(), "extensions", "notify-dot", "foreground-check.ps1");
+const PROBE_SCRIPT = fileURLToPath(new URL("./foreground-check.ps1", import.meta.url));
 const PWSH_FALLBACK = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
 const CACHE_MS = 3_000;
 const TIMEOUT_MS = 4_000;

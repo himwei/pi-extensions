@@ -1,5 +1,6 @@
 import type { BashOperations } from "@earendil-works/pi-coding-agent";
-import { runProcess } from "../run-script/process.js";
+import { runProcess, type ExecOutcome } from "../run-script/process.js";
+import { ProcessExecutionError, type ExecutionState } from "../run-script/execution.js";
 import { assertNoLegacyInvocation, resolvePowerShell7 } from "../run-script/powershell.js";
 
 const DEFAULT_TIMEOUT_SECONDS = 120;
@@ -16,7 +17,7 @@ const POWERSHELL_ENCODING_PREFIX = [
 ].join("\n");
 
 
-export function createPowerShellOperations(): BashOperations {
+export function createPowerShellOperations(observe?: (state: ExecutionState) => void, complete?: (outcome: ExecOutcome) => void): BashOperations {
   return {
     async exec(command, cwd, options) {
       if (options.signal?.aborted) {
@@ -36,9 +37,16 @@ export function createPowerShellOperations(): BashOperations {
       const usesWsl = await assertNoLegacyInvocation(command, executable, env, options.signal);
       const script = `${POWERSHELL_ENCODING_PREFIX}\n${command}`;
 
-      const result = await runProcess(executable,
+      let result: ExecOutcome;
+      try { result = await runProcess(executable,
         ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
-        cwd, { env, signal: options.signal, timeoutMs: timeoutSeconds * 1000, onData: options.onData, windowsJob: !usesWsl });
+        cwd, { env, signal: options.signal, timeoutMs: timeoutSeconds * 1000, onData: options.onData, windowsJob: !usesWsl,
+          onState: observe, log: true }); }
+      catch (error) {
+        if (error instanceof ProcessExecutionError) complete?.(error.outcome as ExecOutcome);
+        throw error;
+      }
+      complete?.(result);
       if (result.timedOut) throw new Error(`timeout:${timeoutSeconds}`);
       return { exitCode: result.exitCode };
     },

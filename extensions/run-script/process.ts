@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { finished } from "node:stream/promises";
 import { resolvePowerShell7 } from "./powershell.js";
+import { ProcessExecutionError, type ExecutionState } from "./execution.js";
 
 const MEMORY_TAIL_CHARS = 256 * 1024;
 const STREAM_VIEW_CHARS = 4000;
@@ -35,6 +36,7 @@ export async function shutdownProcesses(): Promise<void> {
 }
 
 export interface ExecOutcome {
+  execution: ExecutionState;
   exitCode: number | null;
   output: string;
   timedOut: boolean;
@@ -56,6 +58,7 @@ export async function runProcess(exe: string, args: string[], cwd: string, optio
   log?: boolean;
   maxLogBytes?: number;
   logDirectory?: string;
+  onState?: (state: ExecutionState) => void;
   /** WSL brokers outlive commands; use client-tree cleanup for WSL calls. */
   windowsJob?: boolean;
 }): Promise<ExecOutcome> {
@@ -71,6 +74,18 @@ export async function runProcess(exe: string, args: string[], cwd: string, optio
   const runner = process.platform === "win32" && options.windowsJob !== false && !/^wsl\.exe$/i.test(basename(exe))
     ? (/^pwsh\.exe$/i.test(basename(exe)) ? exe : await resolvePowerShell7(env, options.signal)) : undefined;
   options.signal?.throwIfAborted();
+  const started = performance.now();
+  let execution: ExecutionState = { id: randomUUID(), startedAt: new Date().toISOString(), elapsedMs: 0,
+    phase: "starting", cleanup: { requested: false,
+      scope: runner ? "windows-job" : process.platform === "win32" ? "windows-client-tree" : "process", result: "not_requested" } };
+  const publish = (changes: Partial<ExecutionState> = {}) => {
+    execution = Object.fromEntries(Object.entries({ ...execution, ...changes,
+      elapsedMs: Math.max(0, performance.now() - started) }).filter(([, value]) => value !== undefined)) as ExecutionState;
+    // Observability must not turn a successful command into a failed mutation.
+    try { options.onState?.({ ...execution, cleanup: { ...execution.cleanup } }); }
+    catch { execution = { ...execution, warning: "Execution status observer failed; diagnostics may be incomplete." }; }
+  };
+  publish();
   const child = spawn(runner ?? exe, runner
     ? ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", join(__dirname, "job-runner.ps1")]
     : args, { cwd, env, windowsHide: true, stdio: [runner ? "pipe" : "ignore", "pipe", "pipe"] });
@@ -79,7 +94,7 @@ export async function runProcess(exe: string, args: string[], cwd: string, optio
   let tailDropped = false, timedOut = false;
   let failure: Error | undefined;
   let logWarning: string | undefined;
-  const logPath = options.log ? join(options.logDirectory ?? tmpdir(), `pi-run-script-${randomUUID()}.log`) : undefined;
+  const logPath = options.log ? join(options.logDirectory ?? tmpdir(), `pi-run-script-${execution.id}.log`) : undefined;
   const log = logPath ? createWriteStream(logPath, { encoding: "utf8", flags: "wx" }) : undefined;
   const logDone = log ? finished(log).then(() => undefined, error => error as Error) : undefined;
   let logOwned = false;
@@ -88,6 +103,8 @@ export async function runProcess(exe: string, args: string[], cwd: string, optio
   let lastUpdate = -Infinity;
   let stopping: Promise<void> | undefined;
   const stop = () => {
+    if (execution.phase === "finished") return stopping ?? Promise.resolve();
+    if (!stopping) publish({ phase: "stopping", cleanup: { ...execution.cleanup, requested: true, result: "unverified" } });
     child.stdout!.resume(); child.stderr!.resume();
     return stopping ??= terminateProcessTree(child);
   };
@@ -138,7 +155,7 @@ export async function runProcess(exe: string, args: string[], cwd: string, optio
   };
   child.stdout!.setEncoding("utf8").on("data", append);
   child.stderr!.setEncoding("utf8").on("data", append);
-  log?.once("open", () => { logOwned = true; });
+  log?.once("open", () => { logOwned = true; publish({ outputLogPath: logPath }); });
   log?.on("drain", () => { child.stdout!.resume(); child.stderr!.resume(); });
   log?.on("error", error => disableLog(`Full output log unavailable: ${error.message}`));
   child.stdin?.on("error", error => { if (!options.signal?.aborted && !timedOut) callbackFailed(error); });
@@ -146,6 +163,7 @@ export async function runProcess(exe: string, args: string[], cwd: string, optio
     child.once("error", error => { failure ??= error; });
     child.once("close", resolve);
   });
+  child.once("spawn", () => publish({ ownerPid: child.pid, phase: "owner_started" }));
   if (runner) child.stdin!.end(JSON.stringify({ exe, args, cwd }), "utf8");
   const abort = () => { void stop(); };
   options.signal?.addEventListener("abort", abort, { once: true });
@@ -165,10 +183,16 @@ export async function runProcess(exe: string, args: string[], cwd: string, optio
   const logError = await logDone;
   if (logError && !logDisabled) disableLog(`Full output log unavailable: ${logError.message}`);
   if (logDisabled && logOwned && logPath) await unlink(logPath).catch(() => { /* Incomplete log is never advertised. */ });
-  if (options.signal?.aborted) throw new Error("aborted");
-  if (failure) throw failure;
   if (options.onUpdate) emit();
-  if (failure) throw failure;
-  return { exitCode, output, timedOut, totalBytes, totalLines, tailDropped,
+  publish({ phase: "finished", finishedAt: new Date().toISOString(), exitCode,
+    status: timedOut ? "timed_out" : options.signal?.aborted ? "cancelled" : failure ? "failed" : stopping ? "stopped" : "exited",
+    cleanup: { ...execution.cleanup, result: execution.cleanup.requested ?
+      (child.exitCode !== null || child.signalCode !== null ? "owner_exited" : "unverified") : "not_requested" },
+    outputLogPath: logDisabled ? undefined : logPath,
+    warning: [execution.warning, logWarning].filter(Boolean).join("; ") || undefined });
+  const outcome: ExecOutcome = { execution, exitCode, output, timedOut, totalBytes, totalLines, tailDropped,
     logPath: logDisabled ? undefined : logPath, logWarning };
+  if (options.signal?.aborted) throw new ProcessExecutionError("aborted", outcome);
+  if (failure) throw new ProcessExecutionError(failure.message, outcome);
+  return outcome;
 }

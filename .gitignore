@@ -7,6 +7,9 @@ auth.json
 .env
 .env.*
 
+# Disposable offline validation configuration
+.tsconfig-test-*.json
+
 # Editor and OS files
 .vscode/
 .idea/

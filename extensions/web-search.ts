@@ -13,7 +13,7 @@
  * Session-scoped TTL cache dedupes exact repeats for free; billing counters are
  * per process (5 CNY / 1000 successful calls). The process-local daily quota
  * resets on the local calendar date; restarts reset it too. Credentials come from
- * web-search/.env, then pi's deepseek API-key credential (see client.ts).
+ * personal config, legacy web-search/.env, then Pi's deepseek API-key credential (see client.ts).
  */
 import { Type } from "@earendil-works/pi-ai";
 import type { Component } from "@earendil-works/pi-tui";
@@ -28,6 +28,7 @@ import {
 import { ApiError, LimitError, PRICE_PER_CALL_CNY, SearchClient, type FetchResult, type SearchDetails } from "./web-search/client.js";
 import { commandRequest, showOverlay } from "./web-search/command-ui.js";
 import { recordExpense } from "./shared/billing.js";
+import { registerManagedTool } from "./shared/managed-tools.js";
 import {
   buildFetchLines,
   buildSearchLines,
@@ -94,7 +95,7 @@ export default function webSearch(pi: ExtensionAPI, client = new SearchClient())
   pi.on("session_shutdown", () => { lifecycle.abort(); unsubscribe?.(); unsubscribe = undefined; });
   const requestSignal = (signal?: AbortSignal) => signal ? AbortSignal.any([signal, lifecycle.signal]) : lifecycle.signal;
 
-  pi.registerTool(
+  registerManagedTool(pi,
     defineTool({
       name: "web_search",
       label: "Web Search",
@@ -180,7 +181,7 @@ export default function webSearch(pi: ExtensionAPI, client = new SearchClient())
     }),
   );
 
-  pi.registerTool(
+  registerManagedTool(pi,
     defineTool({
       name: "web_fetch",
       label: "Web Fetch",

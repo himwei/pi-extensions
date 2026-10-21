@@ -1,0 +1,28 @@
+{
+  "name": "whitejoce-pi-extensions",
+  "private": true,
+  "type": "module",
+  "description": "Windows PowerShell execution and terminal extensions for Pi",
+  "license": "MIT",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": [
+      "./extensions/auto-summary.ts",
+      "./extensions/powershell-bash.ts",
+      "./extensions/tps-status.ts",
+      "./extensions/anim-compaction.ts",
+      "./extensions/notify-dot.ts",
+      "./extensions/ai-rename.ts",
+      "./extensions/permission-gate.ts",
+      "./extensions/web-search.ts",
+      "./extensions/write-transforms.ts",
+      "./extensions/plugin-manager.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  }
+}

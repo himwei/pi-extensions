@@ -1,17 +1,18 @@
 import { shutdownProcesses } from "./run-script/process.js";
 import {
-  createBashToolDefinition,
-  createPowerShellToolDefinition,
   type ExtensionAPI,
 } from "@earendil-works/pi-coding-agent";
 import { createPowerShellOperations } from "./powershell-bash/operations.js";
+import { observedShell } from "./powershell-bash/tools.js";
+import { executionObserver, registerHarnessDiagnostics } from "./shared/harness-diagnostics.js";
+import { executionText, type ExecutionState } from "./run-script/execution.js";
 
 export default function (pi: ExtensionAPI) {
-  const operations = createPowerShellOperations();
+  registerHarnessDiagnostics(pi);
   pi.on("session_shutdown", () => shutdownProcesses());
 
   pi.on("session_start", (_event, ctx) => {
-    const tools = [createBashToolDefinition(ctx.cwd, { operations }), createPowerShellToolDefinition(ctx.cwd, { operations })];
+    const tools = [observedShell(ctx.cwd, "bash", pi), observedShell(ctx.cwd, "powershell", pi)];
     for (const tool of tools) pi.registerTool({
       ...tool,
       // Keep native powershell opt-in through --tools/defaultTools/setActiveTools.
@@ -28,9 +29,18 @@ export default function (pi: ExtensionAPI) {
         "Specify -Encoding utf8 when writing text with Out-File or Set-Content.",
         "Python commands inherit UTF-8 defaults via PYTHONUTF8 and PYTHONIOENCODING when those variables are unset; override them only for an explicit compatibility requirement.",
         "Non-terminating cmdlet errors stop the command with a failing exit code; pass an explicit -ErrorAction such as SilentlyContinue when partial results are intended.",
+        "Use run-script for complex scripts when available. Otherwise save a script with write, explicitly syntax-check it and run by file path; do not inline it.",
+        "Emit heterogeneous inspection results as JSON or explicitly formatted sections. Separate modification, verification and cleanup calls.",
+        "Execution metadata tracks the process owner, not UAC acceptance or elevated descendants. Timeout can leave partial changes; verify before retrying.",
       ],
     });
   });
 
-  pi.on("user_bash", () => ({ operations }));
+  pi.on("user_bash", (_event, ctx) => {
+    const record = executionObserver(pi, ctx, "user_bash");
+    let final: ExecutionState | undefined;
+    return { operations: createPowerShellOperations(state => { final = state; record(state); }, () => {
+      if (final?.status && final.status !== "exited") ctx?.ui?.notify(executionText(final), "warning");
+    }) };
+  });
 }

@@ -6,15 +6,17 @@
  * are retried with backoff, other 4xx are not.
  *
  * Credentials resolution (first hit wins):
- *   1. .env in this extension's folder (base_url=..., api_key=...)
- *   2. pi's auth.json `deepseek` entry (readStoredCredential)
+ *   1. config/pi-extensions/.env.web-search under Pi's agent directory
+ *   2. Legacy .env in this extension's folder (base_url=..., api_key=...)
+ *   3. pi's auth.json `deepseek` entry (readStoredCredential)
  * The API key is never included in errors, logs, or tool details.
  */
 import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
-import { readStoredCredential } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, readStoredCredential } from "@earendil-works/pi-coding-agent";
 import { ApiError, validateUrl, responseText, searchResults, fetchResult } from "./response.js";
 export { ApiError, validateUrl } from "./response.js";
 
@@ -93,13 +95,34 @@ export function parseEnvText(text: string): Record<string, string> {
   return out;
 }
 
-/** Read the extension folder's own .env (web-search/.env); missing file is empty. */
-export function readExtEnvFile(): Record<string, string> {
+function readEnvPath(path: string): Record<string, string> {
   try {
-    return parseEnvText(readFileSync(fileURLToPath(new URL(".env", import.meta.url)), "utf-8"));
+    return parseEnvText(readFileSync(path, "utf-8"));
   } catch {
     return {};
   }
+}
+
+/** Legacy configuration for manual installs. */
+export function readExtEnvFile(): Record<string, string> {
+  return readEnvPath(fileURLToPath(new URL(".env", import.meta.url)));
+}
+
+/** Personal configuration stays outside the checkout managed by Pi updates. */
+export function readConfigEnvFile(
+  userPath = join(getAgentDir(), "config", "pi-extensions", ".env.web-search"),
+  legacyPath = fileURLToPath(new URL(".env", import.meta.url)),
+): Record<string, string> {
+  const legacy = readEnvPath(legacyPath);
+  const user = readEnvPath(userPath);
+  const key = user.api_key ?? user.apikey;
+  const baseUrl = user.base_url ?? user.baseUrl;
+  return {
+    ...legacy,
+    ...user,
+    ...(key !== undefined ? { api_key: key } : {}),
+    ...(baseUrl !== undefined ? { base_url: baseUrl } : {}),
+  };
 }
 
 /** Session cache with TTL, entry count and an approximate UTF-16 byte budget. */
@@ -158,7 +181,7 @@ export interface ClientOptions {
   now?: () => number;
   /** Credential reader override; defaults to pi's readStoredCredential. */
   readCredential?: (providerId: string) => { type: string; key?: string } | undefined;
-  /** Extension .env reader override; defaults to reading web-search/.env. */
+  /** File configuration override; defaults to personal config over legacy extension .env. */
   readEnvFile?: () => Record<string, string>;
 }
 
@@ -189,7 +212,7 @@ export class SearchClient {
     this.cache = new SearchCache(CACHE_TTL_MS, CACHE_MAX_ENTRIES, this.now);
     this.pages = new TtlCache(CACHE_TTL_MS, CACHE_MAX_ENTRIES, this.now);
     if (!this.apiKey) {
-      this.lastError = "no API key: web-search/.env or a deepseek api_key credential in auth.json";
+      this.lastError = "no API key: config/pi-extensions/.env.web-search, legacy web-search/.env or a deepseek api_key credential in auth.json";
     }
   }
 
@@ -380,7 +403,7 @@ export function mirrorOf(results: { title: string; url: string }[]): number[] {
 }
 
 
-/** Resolve credentials: extension-folder .env overrides pi auth.json `deepseek` entry. */
+/** Resolve credentials: personal config > legacy extension .env > Pi deepseek credential. */
 export function resolveCredentials(
   readCred: (providerId: string) => { type: string; key?: string } | undefined = (id) => {
     try {
@@ -389,7 +412,7 @@ export function resolveCredentials(
       return undefined;
     }
   },
-  readEnvFile: () => Record<string, string> = readExtEnvFile,
+  readEnvFile: () => Record<string, string> = readConfigEnvFile,
 ): { apiKey?: string; baseUrl?: string; source: "file" | "auth.json" | "none" } {
   let stored: { type: string; key?: string } | undefined;
   try {
