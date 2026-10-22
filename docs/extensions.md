@@ -112,6 +112,24 @@ api_key=填写你自己的密钥
 
 也可以参照 [配置示例](web-search.env.example)。如果已有 Pi 的 `deepseek` API key 且使用默认服务地址，无需另建文件。配置读取不会自动创建、迁移或覆盖文件；修改配置后执行 `/reload` 或重启 Pi。
 
+### 交互配置与新手接入
+
+无需手工编辑配置文件，在 Pi 交互终端运行：
+
+```text
+/websearch setup
+/websearch provider
+/websearch status
+```
+
+`setup` 先选择“自动（优先 DeepSeek）/ DeepSeek / AnySearch”，再为相应渠道配置凭据。已有 API Key 时使用专用隐藏输入界面，支持粘贴与 Esc 取消；只显示星号，不使用普通对话输入，也不会把密钥写入会话记录。确认后密钥以明文保存在个人配置文件，POSIX 新文件权限为 0600，Windows 使用目录继承权限；这不是加密凭据库，请保护个人目录。
+
+AnySearch 还提供“使用真实邮箱注册并获取 API Key”选项：输入邮箱，明确确认将其发送至官方服务、创建账号及本地保存密钥后，只发送一次注册请求。成功后安全保存取回的密钥并立即应用，默认策略仍优先 DeepSeek。新注册密钥只用于 AnySearch 官方地址，不继承旧代理地址。邮箱已注册时引导官网登录获取密钥，不会重复注册；如果网络中断、取消或密钥保存失败，账号可能已创建，应先去官网登录确认，不自动重试或换号。
+
+`provider` 打开策略选择菜单，也可用 `/websearch provider auto|deepseek|anysearch` 直接切换。保存立即生效，取消旧请求并清空旧渠道缓存和上一轮结果，不需要 `/reload`。界面取消或配置发生并发变更时不覆盖现有文件。`status` 说明当前策略、实际渠道、选择原因，以及各渠道“已配置/未配置”的凭据状态，不显示密钥或其前缀；“已配置”不代表服务端已经验证有效。
+
+密钥输入和注册仅在 Pi 交互终端中开放，RPC/无界面模式不会回退到明文密钥输入。不要把密钥作为 `/websearch setup` 的命令参数。手动编辑文件的方式仍受支持，手动修改后需 `/reload` 或重启。
+
 ### AnySearch 渠道
 
 同一个扩展支持 DeepSeek 与 AnySearch，不需要额外安装搜索插件。工具名、分页、缓存、取消与 `/websearch` 命令保持不变。默认 `provider=auto`：优先使用已配置的 DeepSeek 密钥（含 Pi 保存的 API key），没有时使用已配置的 AnySearch 密钥；两个都没有时明确提示配置。只配置 AnySearch 密钥即可自动使用，不必指定渠道。示例：
@@ -138,7 +156,7 @@ anysearch_base_url=https://api.anysearch.com
 
 官方 [AnySearch Skill README](https://github.com/anysearch-ai/anysearch-skill#register-for-an-api-key-recommended) 提供邮箱注册取钥流程：向 `https://api.anysearch.com/v1/auth/email/register` 发送 `{"email":"真实可接收邮件的邮箱"}`，成功时从 `data.api_key.key` 获取一次性明文密钥。该流程是注册新账号，不是凭任意邮箱登录已有账号；`email_already_registered` 时应前往返回的登录地址自行登录，不重复注册。
 
-这是向第三方发送邮箱并创建账号的操作，必须由用户明确同意。本扩展不会在搜索或启动时擅自注册、登录或自动保存新密钥。可在官方控制台 https://anysearch.com/console/api-keys 获取密钥，再安全写入个人配置的 `anysearch_api_key`。邮箱已注册、注册失败或额度不足不会触发批量注册或自动换号。获取密钥的门槛与每次调用费用是两回事，具体成本以官方套餐及账户额度为准。
+这是向第三方发送邮箱并创建账号的操作，必须由用户明确同意。推荐通过 `/websearch setup` 的邮箱注册向导完成；本扩展不会在搜索或启动时擅自注册、登录或保存新密钥。可在官方控制台 https://anysearch.com/console/api-keys 获取密钥，再安全写入个人配置的 `anysearch_api_key`。邮箱已注册、注册失败或额度不足不会触发批量注册或自动换号。获取密钥的门槛与每次调用费用是两回事，具体成本以官方套餐及账户额度为准。
 
 官方接口文档：[Search](https://anysearch.com/docs/api-endpoints/v1-search)、[Extract](https://anysearch.com/docs/api-endpoints/v1-extract)。
 

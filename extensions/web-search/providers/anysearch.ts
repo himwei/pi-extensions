@@ -1,6 +1,7 @@
 import type { SearchAdapter } from "../provider.js";
 import { ApiError, fetchResult, validateUrl } from "../response.js";
 import type { FetchResult, SearchResult } from "../types.js";
+import { ANYSEARCH_LOGIN, registerAnySearch } from "./anysearch-registration.js";
 
 const object = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
@@ -52,6 +53,7 @@ export const anysearch = {
     request: (url, key) => ({ path: "/v1/extract", method: "POST", headers: headers(key), body: { url } }),
     parse: anyFetchResult,
   },
+  registration: { loginUrl: ANYSEARCH_LOGIN, createKey: registerAnySearch },
   httpError(status, _text, responseHeaders) {
     const id = responseHeaders.get("x-request-id");
     const requestId = id && /^[a-f\d-]{36}$/i.test(id) ? id : undefined;

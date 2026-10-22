@@ -34,6 +34,11 @@ export interface SearchAdapter {
     request(url: string, apiKey: string): ProviderRequest;
     parse(value: unknown): FetchResult;
   };
+  /** Explicit interactive onboarding only; never invoked by selection or search. */
+  readonly registration?: {
+    readonly loginUrl: string;
+    createKey(email: string, fetchImpl: typeof fetch, signal: AbortSignal): Promise<string>;
+  };
   httpError(status: number, text: string, headers: Headers): ApiError;
   networkError(error: unknown): ApiError;
 }

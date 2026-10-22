@@ -27,6 +27,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { ApiError, LimitError, SearchClient, type FetchResult, type SearchDetails } from "./web-search/client.js";
 import { commandRequest, showOverlay } from "./web-search/command-ui.js";
+import { SearchSettings } from "./web-search/settings.js";
 import { recordExpense } from "./shared/billing.js";
 import {
   buildFetchLines,
@@ -67,21 +68,34 @@ type FetchErrDetails = { url: string; error: string };
 type SearchToolDetails = SearchDetails | SearchErrDetails;
 type FetchToolDetails = FetchDetails | FetchErrDetails;
 
-export default function webSearch(pi: ExtensionAPI, client = new SearchClient()) {
+export default function webSearch(pi: ExtensionAPI, client = new SearchClient(), settings = new SearchSettings()) {
   let lifecycle = new AbortController();
   let lastSearch: SearchDetails | null = null;
   let context: ExtensionContext | undefined;
   let ledgerError = false;
-  const subscribe = () => client.onCharge(charge => {
+  let settingsBusy = false;
+  const subscribe = () => {
+    const sourceClient = client;
+    return sourceClient.onCharge(charge => {
     try {
       recordExpense(pi, { id: charge.id, source: "web-search", kind: charge.kind,
-        amount: charge.amountCny, currency: "CNY", provider: client.provider, model: "web-service" });
+        amount: charge.amountCny, currency: "CNY", provider: sourceClient.provider, model: "web-service" });
     } catch {
       ledgerError = true;
       context?.ui.notify("web-search 费用写入失败，本次会话的费用统计可能不完整", "warning");
     }
-  });
+    });
+  };
   let unsubscribe: (() => void) | undefined = subscribe();
+  const applyClient = (next: SearchClient) => {
+    lifecycle.abort();
+    lifecycle = new AbortController();
+    unsubscribe?.();
+    client = next;
+    lastSearch = null;
+    ledgerError = false;
+    unsubscribe = subscribe();
+  };
   pi.on("session_start", (_event, ctx) => {
     lifecycle.abort();
     lifecycle = new AbortController();
@@ -261,18 +275,34 @@ export default function webSearch(pi: ExtensionAPI, client = new SearchClient())
   /* ---------- /websearch command family ---------- */
 
   pi.registerCommand("websearch", {
-    description: "Web search: /websearch <query> | /websearch fetch <n|url> | /websearch status",
+    description: "Web search: /websearch setup | provider [auto|deepseek|anysearch] | status | <query> | fetch <n|url>",
     handler: async (args, ctx) => {
       context = ctx;
       const active = lifecycle.signal;
       const argv = args.trim().split(/\s+/).filter(Boolean);
 
+      if (argv[0] === "setup" || argv[0] === "provider") {
+        if (argv.length > (argv[0] === "setup" ? 1 : 2)) {
+          ctx.ui.notify("用法：/websearch setup 或 /websearch provider [auto|deepseek|anysearch]；不要把密钥粘贴到命令中", "error");
+          return;
+        }
+        if (settingsBusy) { ctx.ui.notify("搜索设置已打开，请先完成或取消当前操作", "warning"); return; }
+        settingsBusy = true;
+        const signal = ctx.signal ? AbortSignal.any([active, ctx.signal]) : active;
+        try { await settings.command(argv[0], argv[1], ctx, signal, client, applyClient); }
+        catch (error) {
+          if (!signal.aborted) ctx.ui.notify(errorMessage(error), "error");
+        } finally { settingsBusy = false; }
+        return;
+      }
+
       if (argv.length === 0 || argv[0] === "status") {
         const s = client.stats();
         ctx.ui.notify(
-          `web-search · ${client.provider} · nonempty calls ${s.billed} (cache ${s.cacheHits}) · ` +
+          `选择策略：${client.providerMode === "auto" ? "自动（DeepSeek 优先）" : client.providerMode}\n` +
+            `当前渠道：${client.provider}\n选择原因：${settings.selectionExplanation(client)}\n` + settings.credentialStatus().join("\n") + "\n" +
+          `web-search · nonempty calls ${s.billed} (cache ${s.cacheHits}) · ` +
             (s.estimatedCostCny === null ? "cost unknown (see provider account)" : `est ¥${s.estimatedCostCny.toFixed(3)}`) +
-            ` · mode ${client.providerMode}: ${client.selectionReason}` +
             ` · today ${s.day}: ${s.dailyBilled}/${s.dailyLimit || "off"} (+${s.dailyPending} pending; quota resets on restart)` +
             (s.lastError ? ` · ${s.lastError}` : "") + (ledgerError ? " · 费用记录失败，统计可能不完整" : ""),
           "info",

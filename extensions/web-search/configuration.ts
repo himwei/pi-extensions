@@ -23,7 +23,12 @@ export function parseEnvText(text: string): Record<string, string> {
     const eq = trimmed.indexOf("=");
     if (eq <= 0) continue;
     let value = trimmed.slice(eq + 1).trim();
-    if (!value.startsWith('"') && !value.startsWith("'")) {
+    if (value.startsWith('"')) {
+      try { value = JSON.parse(value); } catch { /* preserve invalid input for validation */ }
+      if (typeof value !== "string") continue;
+    } else if (value.startsWith("'") && value.endsWith("'")) {
+      value = value.slice(1, -1);
+    } else {
       const hash = value.indexOf(" #");
       if (hash >= 0) value = value.slice(0, hash).trim();
     }
@@ -100,20 +105,20 @@ export function selectProvider(
   readCredential?: CredentialReader,
   apiKeyOverride?: string,
   adapters: readonly SearchAdapter[] = orderedProviders(),
-): { adapter: SearchAdapter; credentials: Credentials; reason: string } {
+): { adapter: SearchAdapter; credentials: Credentials; reason: string; reasonCode: "explicit" | "preferred" | "fallback" | "missing" } {
   const ordered = [...adapters].sort((a, b) => a.autoPriority - b.autoPriority || a.id.localeCompare(b.id));
   if (!ordered.length) throw new ApiError(500, "No search providers registered");
   if (mode !== "auto") {
     const adapter = ordered.find(item => item.id === mode);
     if (!adapter) throw new ApiError(400, `web-search provider must be auto or one of: ${ordered.map(item => item.id).join(", ")}`);
-    return { adapter, credentials: credentialsFor(adapter, file, readCredential), reason: "explicit provider selection" };
+    return { adapter, credentials: credentialsFor(adapter, file, readCredential), reason: "explicit provider selection", reasonCode: "explicit" };
   }
   for (const [index, adapter] of ordered.entries()) {
     const credentials = credentialsFor(adapter, file, readCredential);
     if (credentials.apiKey || apiKeyOverride) {
-      return { adapter, credentials, reason: index === 0 ? `${adapter.label} credentials configured (preferred)`
+      return { adapter, credentials, reasonCode: index === 0 ? "preferred" : "fallback", reason: index === 0 ? `${adapter.label} credentials configured (preferred)`
         : `no higher-priority credentials; ${adapter.label} configured` };
     }
   }
-  return { adapter: ordered[0], credentials: { source: "none" }, reason: "no search credentials configured" };
+  return { adapter: ordered[0], credentials: { source: "none" }, reason: "no search credentials configured", reasonCode: "missing" };
 }

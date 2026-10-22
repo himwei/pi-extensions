@@ -14,6 +14,7 @@ adapters, not supported configuration values.
 | `web-search/provider.ts` | Typed adapter contract and request descriptor |
 | `web-search/providers/*.ts` | Provider URLs, auth placement, wire payloads, parsing, errors and prices |
 | `web-search/registry.ts` | Implemented adapters and derived provider ID types |
+| `web-search/settings.ts` | Masked setup, consented onboarding, atomic persistence, hot switching and status |
 | `web-search/configuration.ts` | Personal/legacy config, isolated credentials and deterministic selection |
 | `web-search/transport.ts` | HTTP, bounded UTF-8/JSON, retry deadline, aborts and redirect refusal |
 | `web-search/client.ts` | Cache, local quota reservations, normalized results and operation accounting |
@@ -64,5 +65,10 @@ It proves GET/custom-header auth, a third wire format, per-operation prices,
 cache reuse, credential isolation, priority and search-only capability handling.
 The fixture is not registered and cannot be enabled through user configuration.
 
-No new dependency container, dynamic plugin discovery, automatic account signup,
+Provider adapters can optionally expose an explicit email-registration capability.
+It is invoked only by the consented TUI setup flow, never startup or search.
+AnySearch registration uses its fixed official endpoint, one request without retries,
+and never exposes raw response messages or the one-time key.
+
+No new dependency container, dynamic plugin discovery, unsolicited account signup,
 or unimplemented provider settings are needed for this extension point.

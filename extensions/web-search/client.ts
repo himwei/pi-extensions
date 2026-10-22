@@ -108,6 +108,7 @@ export class SearchClient {
   readonly provider: string;
   readonly providerMode: ProviderMode;
   readonly selectionReason: string;
+  readonly selectionReasonCode: "explicit" | "preferred" | "fallback" | "missing";
   readonly baseUrl: string;
   private readonly apiKey: string;
   private readonly adapter: SearchAdapter;
@@ -133,6 +134,7 @@ export class SearchClient {
     const selection = selectProvider(mode, config, opts.readCredential, opts.apiKey, opts.adapters);
     this.providerMode = mode as ProviderMode;
     this.selectionReason = selection.reason;
+    this.selectionReasonCode = selection.reasonCode;
     this.adapter = selection.adapter;
     this.provider = this.adapter.id;
     const env = selection.credentials;
