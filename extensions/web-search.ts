@@ -1,5 +1,5 @@
 /**
- * web-search: DeepSeek Search/Fetch tools for pi.
+ * web-search: DeepSeek or AnySearch Search/Fetch tools for pi.
  *
  * Registers two read-only tools and a /websearch command family:
  *   - web_search(query, count?) — ranked results with model-facing summaries;
@@ -8,12 +8,12 @@
  *   - web_fetch(url, offset?) — paged Markdown of one page.
  *   - /websearch <query> — direct search overlay (no model round-trip)
  *   - /websearch fetch <n|url> — fetch the n-th result of the last /websearch
- *   - /websearch status — billed calls, cache hits, estimated cost
+ *   - /websearch status — provider, nonempty calls, cache hits, estimated cost
  *
  * Session-scoped TTL cache dedupes exact repeats for free; billing counters are
- * per process (5 CNY / 1000 successful calls). The process-local daily quota
+ * per process (DeepSeek: 5 CNY / 1000 successful calls; AnySearch: price unknown). The process-local daily quota
  * resets on the local calendar date; restarts reset it too. Credentials come from
- * personal config, legacy web-search/.env, then Pi's deepseek API-key credential (see client.ts).
+ * personal config or legacy web-search/.env; only DeepSeek falls back to Pi's credential (see client.ts).
  */
 import { Type } from "@earendil-works/pi-ai";
 import type { Component } from "@earendil-works/pi-tui";
@@ -25,7 +25,7 @@ import {
   type Theme,
   type ToolRenderResultOptions,
 } from "@earendil-works/pi-coding-agent";
-import { ApiError, LimitError, PRICE_PER_CALL_CNY, SearchClient, type FetchResult, type SearchDetails } from "./web-search/client.js";
+import { ApiError, LimitError, SearchClient, type FetchResult, type SearchDetails } from "./web-search/client.js";
 import { commandRequest, showOverlay } from "./web-search/command-ui.js";
 import { recordExpense } from "./shared/billing.js";
 import {
@@ -75,7 +75,7 @@ export default function webSearch(pi: ExtensionAPI, client = new SearchClient())
   const subscribe = () => client.onCharge(charge => {
     try {
       recordExpense(pi, { id: charge.id, source: "web-search", kind: charge.kind,
-        amount: charge.amountCny, currency: "CNY", provider: "deepseek", model: "web-service" });
+        amount: charge.amountCny, currency: "CNY", provider: client.provider, model: "web-service" });
     } catch {
       ledgerError = true;
       context?.ui.notify("web-search 费用写入失败，本次会话的费用统计可能不完整", "warning");
@@ -100,11 +100,11 @@ export default function webSearch(pi: ExtensionAPI, client = new SearchClient())
       label: "Web Search",
       description:
         "Search the web and return ranked results with summaries. Supports site:, -site:, \"exact phrase\", | (OR) and .. (range) syntax. " +
-        "Each result carries rerank_score (0-3, >=1.5 high quality) and authority (0-4, >=3 highly authoritative). " +
-        "Call web_fetch(url) when you need the full page.",
+        "DeepSeek results carry rerank_score (0-3, >=1.5 high quality) and authority (0-4, >=3 highly authoritative). " +
+        "AnySearch does not provide these scores (null). Call web_fetch(url) when you need the full page.",
       promptSnippet: "web search with ranked results and page fetch",
       promptGuidelines: [
-        "Prefer web_search for time-sensitive or unverifiable facts instead of guessing; results include per-source authority scores.",
+        "Prefer web_search for time-sensitive or unverifiable facts instead of guessing; only DeepSeek results include per-source authority scores; null means unavailable, not low quality.",
       ],
       annotations: { readOnlyHint: true, openWorldHint: true },
       parameters: Type.Object({
@@ -117,8 +117,8 @@ export default function webSearch(pi: ExtensionAPI, client = new SearchClient())
         cached: Type.Boolean(),
         results: Type.Array(
           Type.Object({
-            rerank_score: Type.Number(),
-            authority: Type.Integer(),
+            rerank_score: Type.Union([Type.Number(), Type.Null()]),
+            authority: Type.Union([Type.Integer(), Type.Null()]),
             title: Type.String(),
             url: Type.String(),
             snippet: Type.String(),
@@ -208,7 +208,7 @@ export default function webSearch(pi: ExtensionAPI, client = new SearchClient())
         const active = requestSignal(signal);
         try {
           const offset = params.offset ?? 0;
-          const page: FetchResult & { costCny: number } = await client.fetchPage(params.url, active);
+          const page: FetchResult & { costCny: number | null } = await client.fetchPage(params.url, active);
           active.throwIfAborted();
           const length = params.length ?? FETCH_PAGE_CHARS;
           const text = fetchContent(page, params.url, offset, length);
@@ -261,7 +261,7 @@ export default function webSearch(pi: ExtensionAPI, client = new SearchClient())
   /* ---------- /websearch command family ---------- */
 
   pi.registerCommand("websearch", {
-    description: "DeepSeek web search: /websearch <query> | /websearch fetch <n|url> | /websearch status",
+    description: "Web search: /websearch <query> | /websearch fetch <n|url> | /websearch status",
     handler: async (args, ctx) => {
       context = ctx;
       const active = lifecycle.signal;
@@ -270,7 +270,9 @@ export default function webSearch(pi: ExtensionAPI, client = new SearchClient())
       if (argv.length === 0 || argv[0] === "status") {
         const s = client.stats();
         ctx.ui.notify(
-          `web-search · calls ${s.billed} (cache ${s.cacheHits}) · est ¥${(s.billed * PRICE_PER_CALL_CNY).toFixed(3)}` +
+          `web-search · ${client.provider} · nonempty calls ${s.billed} (cache ${s.cacheHits}) · ` +
+            (s.estimatedCostCny === null ? "cost unknown (see provider account)" : `est ¥${s.estimatedCostCny.toFixed(3)}`) +
+            ` · mode ${client.providerMode}: ${client.selectionReason}` +
             ` · today ${s.day}: ${s.dailyBilled}/${s.dailyLimit || "off"} (+${s.dailyPending} pending; quota resets on restart)` +
             (s.lastError ? ` · ${s.lastError}` : "") + (ledgerError ? " · 费用记录失败，统计可能不完整" : ""),
           "info",
