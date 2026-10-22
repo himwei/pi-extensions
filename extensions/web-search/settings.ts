@@ -89,6 +89,38 @@ export class SearchSettings {
       case "missing": return "尚未配置搜索凭据，请运行 /websearch setup";
     }
   }
+  summary(client: SearchClient): string {
+    const label = orderedProviders().find(adapter => adapter.id === client.provider)?.label ?? client.provider;
+    const state = !client.configured ? "未配置" : client.stats().lastError ? "需要处理" : client.verified ? "连接已验证" : "已保存，尚未验证连接";
+    return `状态：${state}\n当前渠道：${client.provider}\n选择策略：${client.providerMode === "auto" ? "自动（DeepSeek 优先）" : client.providerMode}\n选择原因：${this.selectionExplanation(client)}\n${this.credentialStatus().join("\n")}\n下一步：${client.configured ? `可直接搜索，或在 /websearch 中测试 ${label} 连接` : "运行 /websearch 开始配置"}`;
+  }
+  async home(ctx: ExtensionCommandContext, getClient: () => SearchClient, getSignal: () => AbortSignal, apply: (client: SearchClient) => void): Promise<void> {
+    const initial = getClient();
+    const signup = orderedProviders().find(adapter => adapter.registration);
+    const choices = initial.configured ? ["测试一次搜索（可能消耗额度）", "稍后再试", "高级设置"]
+      : [...(signup ? ["邮箱快速开始（推荐）"] : []), "我已有 API Key", "高级设置"];
+    const action = await ctx.ui.select(initial.configured ? this.summary(initial) : "开始联网搜索：已有 DeepSeek 凭据会自动优先使用", choices, { signal: getSignal() });
+    getSignal().throwIfAborted();
+    if (!action || action === "稍后再试") return;
+    if (action === "高级设置") {
+      await this.command("setup", undefined, ctx, getSignal(), getClient(), apply);
+      return;
+    }
+    if (action !== choices[0] || !initial.configured) {
+      const adapterId = action === "邮箱快速开始（推荐）" ? signup?.id
+        : await ctx.ui.select("选择已有密钥的服务", orderedProviders().map(adapter => adapter.label), { signal: getSignal() })
+          .then(label => orderedProviders().find(adapter => adapter.label === label)?.id);
+      getSignal().throwIfAborted();
+      if (!adapterId) return;
+      await this.command("setup", undefined, ctx, getSignal(), getClient(), apply, { adapterId, register: action === "邮箱快速开始（推荐）" });
+      if (getClient() === initial) return;
+      const test = await ctx.ui.select("配置已保存。是否测试一次搜索？可能消耗服务额度。", ["稍后再试", "测试搜索"], { signal: getSignal() });
+      getSignal().throwIfAborted();
+      if (test !== "测试搜索") return;
+    }
+    const result = await commandRequest(ctx, getSignal(), "测试搜索连接", signal => getClient().search("Pi coding agent documentation", 1, signal));
+    if (result) ctx.ui.notify(`连接测试成功，返回 ${result.results.length} 条结果。现在可使用 /websearch <关键词>`, "info");
+  }
   async save(patch: Record<string, string>, expected: string | null, signal: AbortSignal, apply: (client: SearchClient) => void): Promise<void> {
     await withFileMutationQueue(this.path, async () => {
       signal.throwIfAborted();
@@ -122,6 +154,7 @@ export class SearchSettings {
   async command(
     command: "setup" | "provider", argument: string | undefined, ctx: ExtensionCommandContext,
     signal: AbortSignal, client: SearchClient, apply: (client: SearchClient) => void,
+    quick?: { adapterId: string; register: boolean },
   ): Promise<void> {
     if (ctx.mode !== "tui" && (command === "setup" || !argument)) {
       ctx.ui.notify("请在 Pi 交互终端运行 /websearch setup 或 /websearch provider；RPC 不接收密钥。也可用 /websearch provider auto|deepseek|anysearch 切换策略", "info");
@@ -131,22 +164,22 @@ export class SearchSettings {
     const adapters = orderedProviders();
     const modes = [{ id: "auto", label: "自动（优先 DeepSeek）" }, ...adapters.map(a => ({ id: a.id, label: a.label }))];
     const choices = modes.map(mode => mode.label + (mode.id === client.providerMode ? "（当前）" : ""));
-    const selected = argument ?? await ctx.ui.select("选择搜索策略", choices, { signal });
+    const selected = quick ? "auto" : argument ?? await ctx.ui.select("选择搜索策略", choices, { signal });
     signal.throwIfAborted();
     if (selected === undefined) return;
-    const mode = argument ? modes.find(item => item.id === argument)?.id : modes[choices.indexOf(selected)]?.id;
+    const mode = quick ? "auto" : argument ? modes.find(item => item.id === argument)?.id : modes[choices.indexOf(selected)]?.id;
     if (!mode) throw new ApiError(400, `渠道无效，可选 ${modes.map(item => item.id).join("、")}`);
     const patch: Record<string, string> = { provider: mode };
     let activeProvider = client.provider;
     const activate = (next: SearchClient) => { apply(next); activeProvider = next.provider; };
     if (command === "setup") {
-      const adapterChoice = mode === "auto" ? await ctx.ui.select("为哪个渠道配置凭据？自动策略仍优先 DeepSeek", adapters.map(a => a.label), { signal })
+      const adapterChoice = quick ? adapters.find(a => a.id === quick.adapterId)?.label : mode === "auto" ? await ctx.ui.select("为哪个渠道配置凭据？自动策略仍优先 DeepSeek", adapters.map(a => a.label), { signal })
         : adapters.find(a => a.id === mode)?.label;
       signal.throwIfAborted();
       const adapter = adapters.find(a => a.label === adapterChoice);
       if (!adapter) return;
       const methods = adapter.registration ? ["已有 API Key（隐藏输入）", "使用真实邮箱注册并获取 API Key"] : ["已有 API Key（隐藏输入）"];
-      const method = adapter.registration ? await ctx.ui.select(`${adapter.label} 接入方式`, methods, { signal }) : methods[0];
+      const method = quick ? methods[quick.register ? 1 : 0] : adapter.registration ? await ctx.ui.select(`${adapter.label} 接入方式`, methods, { signal }) : methods[0];
       signal.throwIfAborted();
       if (!method) return;
       let key: string | undefined;

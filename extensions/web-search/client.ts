@@ -105,6 +105,8 @@ export interface ClientOptions {
 }
 
 export class SearchClient {
+  verified = false;
+  get configured(): boolean { return this.apiKey.length > 0; }
   readonly provider: string;
   readonly providerMode: ProviderMode;
   readonly selectionReason: string;
@@ -233,6 +235,7 @@ export class SearchClient {
       const body = await this.request(this.adapter.search.request(query, count, this.apiKey), signal);
       signal?.throwIfAborted();
       const results = this.adapter.search.parse(body);
+      this.verified = true;
       const price = this.adapter.priceCny.search;
       const details: SearchDetails = {
         query,
@@ -264,6 +267,7 @@ export class SearchClient {
     try {
       const value = await this.request(fetchAdapter.request(url, this.apiKey), signal);
       const body = fetchAdapter.parse(value);
+      this.verified = true;
       signal?.throwIfAborted();
       const billable = body.content.trim().length > 0;
       if (billable) {

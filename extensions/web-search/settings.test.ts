@@ -134,6 +134,9 @@ try {
     registerCommand(name: string, command: { handler: (args: string, ctx: ExtensionCommandContext) => Promise<void> }) { commands.set(name, command); }, appendEntry() {} } as unknown as ExtensionAPI;
   webSearch(pi, current, service);
   const command = commands.get("websearch")!;
+  const beforeHelp = network;
+  await command.handler("help", headless);
+  assert.equal(network, beforeHelp, "help must never become a billable search");
   await command.handler("provider anysearch", headless);
   const response = await tools.get("web_search")!.execute("test", { query: "integration" }, undefined, undefined, headless);
   assert.equal(response.details.results[0].title, "Any");
@@ -143,6 +146,7 @@ try {
   assert.match(status, /已手动指定 AnySearch/);
   assert.match(status, /DeepSeek：已配置/);
   assert.match(status, /AnySearch：已配置/);
+  assert.ok(!status.includes("本进程今日"), "normal status hides diagnostic counters");
   assert.ok(!status.includes("test-registered-key"));
   const pendingTool = tools.get("web_search")!.execute("pending", { query: "pending" }, undefined, undefined, headless);
   const pendingRejected = assert.rejects(pendingTool);
@@ -151,6 +155,26 @@ try {
   await pendingRejected;
   await command.handler("status", headless);
   assert.match(notices[notices.length - 1], /当前渠道：deepseek/);
+  const freshPath = join(root, "fresh.env");
+  const freshConfig = () => readConfigEnvFile(freshPath, legacy);
+  const freshService = new SearchSettings({ path: freshPath, readConfig: freshConfig, readCredential: () => undefined, fetchImpl });
+  let fresh = new SearchClient({ readEnvFile: freshConfig, readCredential: () => undefined, fetchImpl });
+  selections = [0, 0]; confirmations = [true];
+  const beforeSignup = network;
+  await freshService.home(ctx, () => fresh, () => signal, next => { fresh = next; });
+  assert.equal(fresh.providerMode, "auto");
+  assert.equal(fresh.provider, "anysearch");
+  assert.equal(network, beforeSignup + 1, "quick start registers once and does not silently run a paid test");
+  assert.equal(fresh.verified, false);
+  assert.match(freshService.summary(fresh), /尚未验证/);
+  const configuredFile = freshService.snapshot();
+  selections = [1];
+  await freshService.home(ctx, () => fresh, () => signal, next => { fresh = next; });
+  assert.equal(freshService.snapshot(), configuredFile, "existing credentials need no setup or repeated key entry");
+  selections = [0];
+  await freshService.home(ctx, () => fresh, () => signal, next => { fresh = next; });
+  assert.equal(fresh.verified, true);
+  assert.match(freshService.summary(fresh), /连接已验证/);
   assert.ok(existsSync(path));
   console.log("Settings UI: masking, consent, signup, cancellation, atomic persistence, stale guards, hot switching and production command integration passed");
 } finally { rmSync(root, { recursive: true, force: true }); }

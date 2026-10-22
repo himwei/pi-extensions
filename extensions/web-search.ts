@@ -281,15 +281,26 @@ export default function webSearch(pi: ExtensionAPI, client = new SearchClient(),
       const active = lifecycle.signal;
       const argv = args.trim().split(/\s+/).filter(Boolean);
 
-      if (argv[0] === "setup" || argv[0] === "provider") {
+      if (argv[0] === "help") {
+        ctx.ui.notify("/websearch：开始使用或测试连接\n/websearch <关键词>：搜索\n/websearch provider：高级渠道选择\n/websearch status：简洁状态\n/websearch status --verbose：诊断详情\n帮助不会发起网络请求。", "info");
+        return;
+      }
+      if (argv[0] === "setup" || argv[0] === "provider" || (!argv.length && ctx.mode === "tui")) {
         if (argv.length > (argv[0] === "setup" ? 1 : 2)) {
           ctx.ui.notify("用法：/websearch setup 或 /websearch provider [auto|deepseek|anysearch]；不要把密钥粘贴到命令中", "error");
           return;
         }
         if (settingsBusy) { ctx.ui.notify("搜索设置已打开，请先完成或取消当前操作", "warning"); return; }
         settingsBusy = true;
-        const signal = ctx.signal ? AbortSignal.any([active, ctx.signal]) : active;
-        try { await settings.command(argv[0], argv[1], ctx, signal, client, applyClient); }
+        let signal = ctx.signal ? AbortSignal.any([active, ctx.signal]) : active;
+        try {
+          if (ctx.mode === "tui" && argv[0] !== "provider") {
+            await settings.home(ctx, () => client, () => signal, next => {
+              applyClient(next);
+              signal = requestSignal(ctx.signal);
+            });
+          } else await settings.command(argv[0] as "setup" | "provider", argv[1], ctx, signal, client, applyClient);
+        }
         catch (error) {
           if (!signal.aborted) ctx.ui.notify(errorMessage(error), "error");
         } finally { settingsBusy = false; }
@@ -298,15 +309,12 @@ export default function webSearch(pi: ExtensionAPI, client = new SearchClient(),
 
       if (argv.length === 0 || argv[0] === "status") {
         const s = client.stats();
-        ctx.ui.notify(
-          `选择策略：${client.providerMode === "auto" ? "自动（DeepSeek 优先）" : client.providerMode}\n` +
-            `当前渠道：${client.provider}\n选择原因：${settings.selectionExplanation(client)}\n` + settings.credentialStatus().join("\n") + "\n" +
-          `web-search · nonempty calls ${s.billed} (cache ${s.cacheHits}) · ` +
-            (s.estimatedCostCny === null ? "cost unknown (see provider account)" : `est ¥${s.estimatedCostCny.toFixed(3)}`) +
-            ` · today ${s.day}: ${s.dailyBilled}/${s.dailyLimit || "off"} (+${s.dailyPending} pending; quota resets on restart)` +
-            (s.lastError ? ` · ${s.lastError}` : "") + (ledgerError ? " · 费用记录失败，统计可能不完整" : ""),
-          "info",
-        );
+        const details = argv[1] === "--verbose";
+        ctx.ui.notify(settings.summary(client) + (details
+          ? `\n调用：${s.billed}；缓存命中：${s.cacheHits}；重试：${s.retries}` +
+            `\n本进程今日调用：${s.dailyBilled}/${s.dailyLimit || "不限"}（非服务商余额）` +
+            (s.estimatedCostCny === null ? "\n费用：未知，以服务商账户为准" : `\n预估费用：¥${s.estimatedCostCny.toFixed(3)}`) +
+            (s.lastError ? `\n最近错误：${s.lastError}` : "") + (ledgerError ? "\n费用记录失败" : "") : ""), "info");
         return;
       }
 
