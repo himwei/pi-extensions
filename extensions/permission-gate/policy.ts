@@ -78,12 +78,13 @@ const REDIRECTION = /(?:^|\s)(?:\d?>|<)\s*/;
 const ENV_REFERENCE = /(?<![\w.-])(?:(?:[A-Za-z]:|~|\.{1,2})[\\/]|[\w .-]+[\\/])*\.env(?:\.[\w.-]+)?/gi;
 const AUTH_REFERENCE = /(?<![\w.-])(?:(?:[A-Za-z]:|~|\.{1,2})[\\/]|[\w .-]+[\\/])*auth\.json(?![\w.-])/gi;
 
-export function detectDangerousCommandInfo(command: string): DangerousCommandInfo | undefined {
+export function detectDangerousCommands(command: string): DangerousCommandInfo[] {
+  const results: DangerousCommandInfo[] = [];
   for (const rule of DANGEROUS_COMMAND_RULES) {
     const match = rule.pattern.exec(command);
     if (!match) continue;
     const index = match.index ?? 0;
-    return {
+    results.push({
       label: rule.label,
       zh: rule.zh,
       severity: rule.severity,
@@ -91,9 +92,14 @@ export function detectDangerousCommandInfo(command: string): DangerousCommandInf
       index,
       end: index + match[0].length,
       extractTarget: rule.extractTarget === true,
-    };
+    });
   }
-  return undefined;
+  return results;
+}
+
+/** Compatibility helper for callers interested only in the first rule. */
+export function detectDangerousCommandInfo(command: string): DangerousCommandInfo | undefined {
+  return detectDangerousCommands(command)[0];
 }
 
 export function detectDangerousCommand(command: string): string | undefined {

@@ -1,6 +1,6 @@
 # My Pi Extensions
 
-面向 [Pi](https://github.com/earendil-works/pi) 的十个扩展，以及当前 `~/.pi/agent/AGENTS.md` 规则文件的整理归档。
+面向 [Pi](https://github.com/earendil-works/pi) 的十个扩展、一个升级审查技能，以及 `~/.pi/agent/AGENTS.md` 规则文件的整理归档。
 
 ## 包含内容
 
@@ -12,16 +12,18 @@
 | `anim-compaction` | 压缩上下文时显示动画与统计，`/anim` 切换样式。 |
 | `notify-dot` | 用标题标记提示完成、出错或等待确认，支持焦点清除及 `/notifydiag` 诊断。 |
 | `ai-rename` | `/n` 自动生成会话名称，或直接设置名称。 |
-| `permission-gate` | 拦截敏感文件访问，对高置信度危险命令请求确认。 |
+| `permission-gate` | 拦截敏感文件访问，对危险命令请求确认，提权调用每次单独确认就绪。 |
 | `web-search` | 提供搜索、网页分页和 `/websearch` 直接查询。 |
 | `write-transforms` | 增强 `read/edit/write`：读取版本约束、保守匹配与写后校验。 |
-| `plugin-manager` | `/plugins` 管理扩展选择，可选 Auto 为旧会话补入符合条件的工具。 |
+| `plugin-manager` | `/plugins` 管理 Global/Project 扩展开关，保存后应用原生重载。 |
 
 各扩展的详细用法、配置、费用与行为边界见 [扩展详细说明](docs/extensions.md)。
 
+技能 [`pi-upgrade-review`](skills/pi-upgrade-review/SKILL.md) 通过 `/skill:pi-upgrade-review` 手动审查 Pi 升级对本地扩展的影响，生成有版本号的报告。调用本身不授权修改扩展。
+
 ## 安装与更新
 
-前置要求：Pi（当前适配 1.3.0）、Node.js、Git、PowerShell 7；`notify-dot` 的前台探测仅在 Windows Terminal 下生效。
+前置要求：Pi 1.4.0 或更新版本（当前验证版本为 1.4.0）、Node.js、Git、PowerShell 7；`notify-dot` 的前台探测仅在 Windows Terminal 下生效。
 
 首次安装，在终端执行：
 
@@ -29,7 +31,7 @@
 pi install git:github.com/whitejoce/pi-extensions
 ```
 
-Pi 会记录包来源并加载清单中的十个扩展。使用 `pi list` 查看安装记录，`pi config` 或会话内的 `/plugins` 选择启用的扩展。
+Pi 会记录包来源并发现清单中的十个扩展与一个技能。使用 `pi list` 查看安装记录，`pi config` 选择资源，或在会话内用 `/plugins` 管理扩展选择。
 
 `write-transforms` 要求 edit 前读取当前文件版本、覆盖 write 前完整读取；Shell 和脚本访问不经过这层约束。具体规则见 [文件修改约束](docs/extensions.md#write-transforms)。
 
@@ -61,13 +63,15 @@ pi update git:github.com/whitejoce/pi-extensions
 /plugins
 /plugins status
 /plugins reload
+/skill:pi-upgrade-review [可选升级区间或关注范围]
 ```
 
-- `/summary` 无参数时保存最近一次助手文本回复；带参数时调用当前模型生成文档。两种模式都在当前工作目录创建版本化 Markdown 文件。
+- `/summary` 无参数时保存最近一次助手文本回复；带参数时调用当前模型生成文档。已有会话名时直接复用；未命名时先调用模型生成标题，保存成功后设置会话名。文件保存在当前工作目录，使用 `-vN.md` 避免覆盖。
 - `/anim` 无参数时选择样式，带参数时直接设置；压缩动画会自动显示。
 - `/n` 带名字时直接设置，单独执行时调用当前模型生成名称。
 - `/websearch` 直接调用 DeepSeek Search API；模型也可以使用 `web_search` / `web_fetch` 工具。
-- `/plugins` 管理扩展启用与保存位置，默认 Default；Auto 可补入旧会话遗漏且符合条件的工具。选择变更保存后需重新加载，详见 [扩展管理](docs/extensions.md#plugin-manager)。
+- `/plugins` 在一张表中编辑 Global 默认与 Project 覆盖，Ctrl+R 恢复继承，Ctrl+S 保存两列并关闭界面、重载资源。工具启用由 Pi 原生处理，详见 [扩展管理](docs/extensions.md#plugin-manager)。
+- `/skill:pi-upgrade-review` 读取本地升级记录、核对当前扩展与公开 API，并运行适用的现有离线检查；报告默认归档到实际 Pi agent 目录的 `docs/pi-upgrade-reviews/`，与包代码分开。
 
 摘要生成、自动命名和搜索可能产生费用，并向对应模型或搜索服务发送内容。计费、缓存和取消方式见 [扩展详细说明](docs/extensions.md)。
 
@@ -83,16 +87,16 @@ pi update git:github.com/whitejoce/pi-extensions
 
 重新加载后，可手动验证：
 
-1. 执行 `/summary`，确认当前工作目录出现新的版本化 Markdown 文件（文件名自动生成）。
+1. 在未命名会话执行 `/summary`，确认先生成标题，原回复正文被保存为版本化文件，保存成功后设置会话名；再次保存应复用名字，无需再次请求命名。
 2. 执行 `/summary 整理成要点清单`（任意整理要求），确认使用当前模型生成版本化 Markdown 文档。
 3. 让 Pi 通过 `bash` 执行一个普通 PowerShell 命令，再按需启用 `powershell` 验证同一命令；确认两个入口都使用增强执行器，也可以设置 `PI_POWERSHELL_EXE` 验证可执行文件覆盖。
-4. 在 TUI 中完成一次普通回复，确认状态栏出现 `tps` 值；取消一次回复，确认不显示残值。
+4. 在 TUI 中检查等待、思考和生成状态，以及正常结束后的 TPS；计时不全或短样本应显示对应说明，取消后不保留速度。
 5. 执行 `/anim` 切换样式后触发 `/compact`，确认动画 widget 出现、耗时/消息数正常、Esc 可取消。
 6. 在 Windows Terminal 中跑一个回合并切到其他标签，结束后确认原标签标题出现完成标记并响铃一次；执行裸 `/n` 确认会话与标签标题被重命名。
-7. 让模型读取 `auth.json`，确认访问被拦截；分别通过 `bash` 和启用后的 `powershell` 对测试目录发起危险命令，确认弹出确认层且 `[n]` 默认选中。仅在可安全删除的测试目录中验证 `[a]` 后相同命令自动放行。
+7. 让模型读取 `auth.json`，确认访问被拦截；在隔离测试目录中人工检查 `bash` 和启用后的 `powershell` 确认层、默认拦截及普通操作的会话许可。确认更换工作目录后需重新批准；RunAs/gsudo 执行应每次显示就绪确认，且没有会话放行选项。真实 UAC 交互由使用者按需验证。
 8. 执行 `/websearch status` 确认计费与当日额度显示；执行一次 `/websearch <query>`，确认覆盖层出结果且 Esc 可取消。重复查询、继续读取缓存网页的后续分页，确认不再计费。
 9. 在测试文件上确认未 read 的 edit 被拒绝、局部 read 后可 edit、覆盖 write 需要完整读取；外部改动后应要求重新 read。
-10. 打开 `/plugins`，人工检查标签切换、搜索、选中项和 Settings；选择适当的保存位置后用 Ctrl+S 保存，关闭并 `/reload` 后核对启用结果。
+10. 打开 `/plugins`，人工检查 Global/Project 单元格、搜索、继承说明和配色；修改后按 Ctrl+S，确认界面关闭并完成重载。未信任项目的 Project 列应只读。
 
 `/notifydiag` 的焦点诊断、返回标签时清除标记、`/harness` 提示及 edit 的 diff 展示请人工检查。
 
@@ -105,9 +109,11 @@ pi-extensions/
 ├─ docs/
 │  └─ extensions.md      # 详细用法、配置与行为边界
 ├─ tests/               # 离线包发现、路径与配置回归
+├─ skills/
+│  └─ pi-upgrade-review/ # 升级审查技能及参考文档
 ├─ agent/
 │  └─ AGENTS.md          # Pi Agent 规则归档
-├─ package.json          # Pi 包清单，明确十个扩展入口
+├─ package.json          # Pi 包清单，明确十个扩展入口与一个技能
 ├─ .gitignore
 ├─ LICENSE
 └─ README.md

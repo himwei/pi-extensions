@@ -17,7 +17,8 @@
       "./extensions/web-search.ts",
       "./extensions/write-transforms.ts",
       "./extensions/plugin-manager.ts"
-    ]
+    ],
+    "skills": ["./skills/pi-upgrade-review"]
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

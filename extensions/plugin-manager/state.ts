@@ -1,81 +1,88 @@
-/** Selection drafts are independent of Pi, disk access and terminal rendering. */
+/** Pure two-scope selection drafts. Persistence and Pi runtime are supplied by adapters. */
 export type SaveTarget = "global" | "project";
-export type View = "all" | "unselected" | "selected" | "settings";
-export interface SettingsPaths { global: string; project: string; preferences: string }
-export interface Preferences { mode: "default" | "auto"; saveTarget: SaveTarget }
-export interface Extension {
-  id: string; name: string; source: SaveTarget; path: string;
-  summary?: string; description?: string;
-  tools?: Array<{ name: string; auto: boolean; exposure?: string; sourcePath?: string }>;
-}
-export interface Selection { extension: Extension; enabled: boolean; inherit: boolean }
-export interface InventoryItem { extension: Extension; globalEnabled: boolean; projectOverride?: boolean; enabled: boolean }
-export interface StateSnapshot { items: InventoryItem[]; preferences: Preferences }
+export type ProjectChoice = "inherit" | "on" | "off";
+export interface Extension { id: string; name: string; source: SaveTarget; path: string; tools?: Array<{ name: string }> }
+export interface DraftSelection { enabled: boolean; choice: ProjectChoice }
+export interface InventoryItem { extension: Extension; globalEnabled: boolean; projectChoice: ProjectChoice; enabled: boolean }
+export interface StateSnapshot { items: InventoryItem[] }
+export interface Selection { extension: Extension; scope: SaveTarget; enabled: boolean; inherit: boolean }
+export interface SaveResult { snapshot: StateSnapshot; wroteSelections: boolean; error?: string }
+export type SaveSelections = (selections: Selection[]) => Promise<SaveResult>;
 
 export class SelectionState {
-  extensions: Extension[];
-  protected personal = new Map<string, boolean>();
-  protected project = new Map<string, boolean>();
-  protected draft = new Map<string, boolean>();
-  protected inherit = new Set<string>();
-  autoAdd: boolean;
-  savedAutoAdd: boolean;
-  saveTarget: SaveTarget;
-  savedSaveTarget: SaveTarget;
-  activeTools: string[] = [];
+  extensions: Extension[] = [];
+  private saved = new Map<string, DraftSelection>();
+  private drafts = new Map<string, DraftSelection>();
   reloadRequired = false;
-  constructor(snapshot: StateSnapshot, readonly paths: SettingsPaths, readonly projectName: string, readonly demo = false) {
-    this.extensions = [];
-    this.autoAdd = this.savedAutoAdd = snapshot.preferences.mode === "auto";
-    this.saveTarget = this.savedSaveTarget = snapshot.preferences.saveTarget;
-    this.rebase(snapshot);
+  reloads = 0;
+  constructor(snapshot: StateSnapshot, readonly projectName: string, readonly demo = false,
+    readonly projectTrusted = true, private saveSelections?: SaveSelections) { this.rebase(snapshot); }
+  selection(entry: Extension): Readonly<DraftSelection> { return this.drafts.get(entry.id)!; }
+  effective(entry: Extension, saved = false): boolean {
+    const selection = (saved ? this.saved : this.drafts).get(entry.id)!;
+    return selection.choice === "inherit" ? selection.enabled : selection.choice === "on";
   }
-  personalDefault(extension: Extension) { return this.personal.get(extension.id) ?? true; }
-  projectOverride(extension: Extension) { return this.project.get(extension.id); }
-  effective(extension: Extension) { return this.project.get(extension.id) ?? this.personalDefault(extension); }
-  selected(extension: Extension) { return this.draft.get(extension.id) ?? this.effective(extension); }
-  pending(extension: Extension) { return this.selected(extension) !== this.effective(extension) || this.inherit.has(extension.id); }
-  get changes() { return this.extensions.filter(extension => this.pending(extension)); }
-  get preferenceDirty() { return this.autoAdd !== this.savedAutoAdd; }
-  get destinationDirty() { return this.saveTarget !== this.savedSaveTarget; }
-  get dirty() { return this.changes.length > 0 || this.preferenceDirty || this.destinationDirty; }
-  get preferences(): Preferences { return { mode: this.autoAdd ? "auto" : "default", saveTarget: this.saveTarget }; }
-  get selections(): Selection[] { return this.changes.map(extension => ({ extension, enabled: this.selected(extension), inherit: this.inherit.has(extension.id) })); }
-  toggle(extension: Extension) { this.draft.set(extension.id, !this.selected(extension)); this.inherit.delete(extension.id); }
-  usePersonalDefault(extension: Extension) {
-    if (extension.source !== "global") return;
-    this.draft.set(extension.id, this.personalDefault(extension));
-    if (this.project.has(extension.id)) this.inherit.add(extension.id);
+  changed(entry: Extension, scope?: SaveTarget): boolean {
+    const draft = this.drafts.get(entry.id)!, saved = this.saved.get(entry.id)!;
+    return scope === "global" ? draft.enabled !== saved.enabled : scope === "project" ? draft.choice !== saved.choice :
+      draft.enabled !== saved.enabled || draft.choice !== saved.choice;
   }
-  /** Keep unapplied drafts when a global save leaves project overrides unresolved. */
-  protected rebase(snapshot: StateSnapshot, keepDrafts = false) {
-    const selections = keepDrafts ? this.selections : [];
+  count(scope?: SaveTarget): number { return this.extensions.filter(entry => this.changed(entry, scope)).length; }
+  canEdit(entry: Extension, scope: SaveTarget): boolean { return scope === "global" ? entry.source === "global" : this.projectTrusted; }
+  toggle(entry: Extension, scope: SaveTarget): boolean {
+    if (!this.canEdit(entry, scope)) return false;
+    const draft = this.drafts.get(entry.id)!;
+    if (scope === "global") draft.enabled = !draft.enabled;
+    else draft.choice = this.effective(entry) ? "off" : "on";
+    return true;
+  }
+  inherit(entry: Extension): boolean {
+    if (entry.source !== "global" || !this.projectTrusted) return false;
+    this.drafts.get(entry.id)!.choice = "inherit";
+    return true;
+  }
+  get selections(): Selection[] {
+    return this.extensions.flatMap(extension => {
+      const draft = this.selection(extension);
+      const selections: Selection[] = [];
+      if (this.changed(extension, "global")) selections.push({ extension, scope: "global", enabled: draft.enabled, inherit: false });
+      if (this.changed(extension, "project")) selections.push({ extension, scope: "project", enabled: draft.choice === "on", inherit: draft.choice === "inherit" });
+      return selections;
+    });
+  }
+  private snapshot(): StateSnapshot {
+    return { items: this.extensions.map(extension => ({ extension, globalEnabled: this.selection(extension).enabled,
+      projectChoice: this.selection(extension).choice, enabled: this.effective(extension) })) };
+  }
+  private rebase(snapshot: StateSnapshot, keep: Selection[] = []): void {
     this.extensions = snapshot.items.map(item => item.extension);
-    this.personal.clear(); this.project.clear(); this.draft.clear(); this.inherit.clear();
+    this.saved.clear(); this.drafts.clear();
     for (const item of snapshot.items) {
-      this.personal.set(item.extension.id, item.globalEnabled);
-      if (item.projectOverride !== undefined) this.project.set(item.extension.id, item.projectOverride);
-      this.draft.set(item.extension.id, item.enabled);
+      const value = { enabled: item.globalEnabled, choice: item.projectChoice };
+      this.saved.set(item.extension.id, { ...value }); this.drafts.set(item.extension.id, { ...value });
     }
-    for (const selection of selections) {
-      if (!this.extensions.some(extension => extension.id === selection.extension.id)) continue;
-      this.draft.set(selection.extension.id, selection.enabled);
-      if (selection.inherit && this.project.has(selection.extension.id)) this.inherit.add(selection.extension.id);
+    for (const selection of keep) {
+      const draft = this.drafts.get(selection.extension.id);
+      if (!draft) continue;
+      if (selection.scope === "global") draft.enabled = selection.enabled;
+      else draft.choice = selection.inherit ? "inherit" : selection.enabled ? "on" : "off";
     }
-    this.savedAutoAdd = snapshot.preferences.mode === "auto";
-    this.savedSaveTarget = snapshot.preferences.saveTarget;
   }
-  /** Memory implementation used only by the standalone demo. */
-  async save(): Promise<number> {
-    for (const { extension, enabled, inherit } of this.selections) {
-      if (this.saveTarget === "project") {
-        if (inherit || enabled === this.personalDefault(extension)) this.project.delete(extension.id);
-        else this.project.set(extension.id, enabled);
-        this.inherit.delete(extension.id);
-      } else if (extension.source === "global") this.personal.set(extension.id, enabled);
+  async apply(): Promise<{ changes: number; effectiveChanges: number }> {
+    const selections = this.selections;
+    const changes = this.count();
+    const effectiveChanges = this.extensions.filter(entry => this.effective(entry) !== this.effective(entry, true)).length;
+    if (!selections.length) return { changes: 0, effectiveChanges: 0 };
+    if (this.saveSelections) {
+      const result = await this.saveSelections(selections);
+      this.reloadRequired ||= result.wroteSelections;
+      this.rebase(result.snapshot, selections);
+      if (result.error) throw new Error(result.error);
+      if (this.count()) throw new Error("Some choices were not saved. Review pending cells before applying again.");
+    } else {
+      if (!this.demo) throw new Error("No native configuration adapter is available.");
+      this.rebase(this.snapshot()); this.reloads++;
     }
-    this.savedAutoAdd = this.autoAdd;
-    this.savedSaveTarget = this.saveTarget;
-    return this.changes.length;
+    return { changes, effectiveChanges };
   }
 }

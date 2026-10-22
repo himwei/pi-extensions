@@ -1,28 +1,33 @@
 /**
- * Decode TPS for the latest completed assistant response, following DSH's
- * first generated content -> completion window. Excludes TTFT and tool execution.
- * Uses provider-reported output tokens; never substitutes character/chunk counts
- * or durationMs when token usage or the first-token observation is missing.
- * rmb-footer places the `tps` status at the first line's right edge.
+ * Latest-response decode TPS: provider output tokens / first observed generated
+ * content -> message_end. No character estimate or whole-request duration fallback.
+ * The observation window is client-side, not a server-side generation benchmark.
+ * rmb-footer owns layout and theme styling for the plain-text `tps` status.
  */
 import type { AssistantMessageEvent } from "@earendil-works/pi-ai";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const STATUS_KEY = "tps";
 const LIVE_REFRESH_MS = 400;
+const LIVE_STALE_MS = 1500;
+// A batch delivered in a few milliseconds is not a useful sustained-speed sample.
+const MIN_SAMPLE_MS = 250;
 
-/** Pi can deliver the tool name with toolcall_start rather than a delta. */
+type Phase = "等待输出" | "思考中" | "生成中";
+
+/** Inspect the current event synchronously; partial is shared, not a snapshot.
+ * Only toolcall_start may use its block's name/args. A later empty tool delta
+ * must not start the clock just because that shared block has since filled in. */
 function isTokenEvent(event: AssistantMessageEvent): boolean {
   switch (event.type) {
     case "text_delta":
     case "thinking_delta":
+    case "toolcall_delta":
       return event.delta.length > 0;
-    case "toolcall_start":
-    case "toolcall_delta": {
+    case "toolcall_start": {
       const block = event.partial.content[event.contentIndex];
-      const hasName = block?.type === "toolCall" && block.name.length > 0;
-      const hasArgs = block?.type === "toolCall" && Object.keys(block.arguments).length > 0;
-      return hasName || (event.type === "toolcall_delta" ? event.delta.length > 0 : hasArgs);
+      return block?.type === "toolCall" &&
+        (block.name.length > 0 || Object.keys(block.arguments).length > 0);
     }
     default:
       return false;
@@ -30,7 +35,6 @@ function isTokenEvent(event: AssistantMessageEvent): boolean {
 }
 
 function formatTps(tps: number, streaming: boolean): string {
-  // Match DSH's formatter: whole tokens from 10 up, one decimal below.
   const value = tps >= 10 ? String(Math.round(tps)) : String(Math.round(tps * 10) / 10);
   return `${streaming ? "~" : ""}${value} tok/s`;
 }
@@ -38,62 +42,104 @@ function formatTps(tps: number, streaming: boolean): string {
 export default function tpsStatus(pi: ExtensionAPI) {
   let firstTokenAt: number | undefined;
   let lastPushAt = -Infinity;
+  let lastUsageAt = -Infinity;
+  let maxOutput = 0;
+  let liveText: string | undefined;
+  let published: string | undefined | null = null;
+  let phase: Phase = "等待输出";
+  let sawThinkingDelta = false;
+  let redactedThinking = false;
   let active = false;
+
+  function publish(ctx: ExtensionContext, text: string | undefined): void {
+    if (text === published) return;
+    published = text;
+    ctx.ui.setStatus(STATUS_KEY, text);
+  }
 
   function reset(): void {
     firstTokenAt = undefined;
-    lastPushAt = -Infinity;
-    active = false;
+    lastPushAt = lastUsageAt = -Infinity;
+    maxOutput = 0;
+    liveText = undefined;
+    phase = "等待输出";
+    sawThinkingDelta = redactedThinking = active = false;
   }
 
   pi.on("message_start", (event, ctx) => {
     if (ctx.mode !== "tui" || event.message.role !== "assistant") return;
     reset();
     active = true;
-    ctx.ui.setStatus(STATUS_KEY, undefined);
+    publish(ctx, `TPS · ${phase}`);
   });
 
   pi.on("message_update", (event, ctx) => {
     const message = event.message;
     if (ctx.mode !== "tui" || message.role !== "assistant" || !active) return;
+    const delta = event.assistantMessageEvent;
     const now = performance.now();
-    if (firstTokenAt === undefined && isTokenEvent(event.assistantMessageEvent)) firstTokenAt = now;
-    if (firstTokenAt === undefined) return;
-    const elapsedMs = Math.max(0, now - firstTokenAt);
-    if (elapsedMs <= 0 || now - lastPushAt < LIVE_REFRESH_MS) return;
-
-    // Live usage is not guaranteed to update for every delta, so even provider
-    // usage is labelled provisional. Providers reporting only final usage show
-    // no live estimate rather than inventing token counts from characters.
-    const tokens = message.usage.output;
-    const tps = tokens / (elapsedMs / 1000);
-    if (Number.isFinite(tokens) && tokens > 0 && Number.isFinite(tps)) {
-      lastPushAt = now;
-      ctx.ui.setStatus(STATUS_KEY, formatTps(tps, true));
+    if (delta.type === "thinking_start" || delta.type === "thinking_delta" || delta.type === "thinking_end") {
+      const block = delta.partial.content[delta.contentIndex];
+      if (block?.type === "thinking" && block.redacted) redactedThinking = true;
+      if (delta.type !== "thinking_end") phase = "思考中";
+      if (delta.type === "thinking_delta" && delta.delta.length > 0) sawThinkingDelta = true;
+    } else if (delta.type === "text_start" || delta.type === "toolcall_start" ||
+      ((delta.type === "text_delta" || delta.type === "toolcall_delta") && delta.delta.length > 0)) {
+      phase = "生成中";
     }
+    if (firstTokenAt === undefined && isTokenEvent(delta)) firstTokenAt = now;
+
+    const tokens = message.usage.output;
+    const validTokens = Number.isFinite(tokens) && tokens > 0;
+    const increased = validTokens && tokens > maxOutput;
+    if (increased) {
+      maxOutput = tokens;
+      lastUsageAt = now;
+    }
+    const incompleteTiming = redactedThinking || ((message.usage.reasoning ?? 0) > 0 && !sawThinkingDelta);
+    const elapsedMs = firstTokenAt === undefined ? 0 : now - firstTokenAt;
+    if (incompleteTiming || !validTokens || tokens < maxOutput || now - lastUsageAt >= LIVE_STALE_MS) {
+      liveText = undefined;
+    } else if (increased && elapsedMs >= MIN_SAMPLE_MS && now - lastPushAt >= LIVE_REFRESH_MS) {
+      const tps = tokens / (elapsedMs / 1000);
+      if (Number.isFinite(tps)) {
+        liveText = formatTps(tps, true);
+        lastPushAt = now;
+      }
+    }
+    // Never recalculate with an unchanged count and a growing denominator.
+    // Fresh provisional values may remain until another event detects staleness.
+    publish(ctx, incompleteTiming ? "TPS · 计时不全" : liveText ?? `TPS · ${phase}`);
   });
 
   pi.on("message_end", (event, ctx) => {
     const message = event.message;
-    if (ctx.mode !== "tui" || message.role !== "assistant") return;
-    const decodeMs = active && firstTokenAt !== undefined
-      ? Math.max(0, performance.now() - firstTokenAt)
-      : 0;
-    reset();
+    if (ctx.mode !== "tui" || message.role !== "assistant" || !active) return;
+    const decodeMs = firstTokenAt === undefined ? undefined : performance.now() - firstTokenAt;
+    const incompleteTiming = redactedThinking ||
+      message.content.some(block => block.type === "thinking" && block.redacted) ||
+      ((message.usage.reasoning ?? 0) > 0 && !sawThinkingDelta);
     const tokens = message.usage.output;
-    const tps = tokens / (decodeMs / 1000);
     const completed = message.stopReason === "stop" || message.stopReason === "length" || message.stopReason === "toolUse";
-    const valid = completed && decodeMs > 0 && Number.isFinite(tokens) && tokens >= 0 && Number.isFinite(tps);
-    ctx.ui.setStatus(STATUS_KEY, valid ? formatTps(tps, false) : undefined);
+    let text: string | undefined;
+    if (completed) {
+      if (incompleteTiming) text = "TPS · 计时不全";
+      else if (!Number.isFinite(tokens) || tokens < 0 || decodeMs === undefined || decodeMs < 0) text = "TPS —";
+      else if (decodeMs < MIN_SAMPLE_MS) text = "TPS · 短样本";
+      else {
+        const tps = tokens / (decodeMs / 1000);
+        text = Number.isFinite(tps) ? formatTps(tps, false) : "TPS —";
+      }
+    }
+    reset();
+    publish(ctx, text); // Aborted/error/deferred replies never retain a provisional speed.
   });
 
-  pi.on("session_start", (_event, ctx) => {
+  const clear = (_event: unknown, ctx: ExtensionContext) => {
     reset();
-    if (ctx.mode === "tui") ctx.ui.setStatus(STATUS_KEY, undefined);
-  });
-  pi.on("session_shutdown", () => reset());
-  pi.on("model_select", (_event, ctx) => {
-    reset();
-    if (ctx.mode === "tui") ctx.ui.setStatus(STATUS_KEY, undefined);
-  });
+    if (ctx.mode === "tui") publish(ctx, undefined);
+  };
+  pi.on("session_start", clear);
+  pi.on("session_shutdown", clear);
+  pi.on("model_select", clear);
 }

@@ -9,9 +9,9 @@
  *   [n] 阻止（默认）   [y] 允许一次   [a] 本会话允许   ←→ 选择 · ⏎ 确认 · esc 取消
  *   ─── 边线
  *
- * ←/→ 在三项间移动（钳位，选中项仅以严重度色加粗区分，无额外标记）；
+ * ←/→ 在选项间移动（提权只有取消/一次；钳位，选中项仅以严重度色加粗区分）；
  * Enter 确认选中项（默认选中「阻止」）；n/y/a 仍是直接快捷键；esc = 取消。
- * a = 按命令 sha256 记入会话放行名单；overlay 不替换编辑器；abort 时通过 done 回调关闭。
+ * 非提权的 a = 按命令 sha256 记入会话放行名单；overlay 不替换编辑器；abort 时通过 done 回调关闭。
  */
 
 import type { Component, TUI } from "@earendil-works/pi-tui";
@@ -30,6 +30,11 @@ export interface GateDialogData {
   preview: CommandPreview;
   /** Offsets into the original command for the inverted danger segment. */
   danger: { start: number; end: number };
+  additionalDangers?: Array<{ start: number; end: number }>;
+  /** Controls rendering, navigation AND direct shortcuts. Defaults preserve destructive-command dialogs. */
+  allowSession?: boolean;
+  onceLabel?: string;
+  rejectLabel?: string;
 }
 
 function formatBytes(bytes: number): string {
@@ -37,11 +42,7 @@ function formatBytes(bytes: number): string {
 }
 
 export class GateConfirmComponent implements Component {
-  private static readonly OPTIONS = [
-    { key: "n", label: "阻止（默认）", outcome: "rejected" },
-    { key: "y", label: "允许一次", outcome: "allowed-once" },
-    { key: "a", label: "本会话允许", outcome: "allowed-session" },
-  ] as const;
+  private readonly options: Array<{ key: string; label: string; outcome: GateUserOutcome }>;
 
   private readonly tui: TUI | undefined;
   private readonly theme: Theme;
@@ -55,6 +56,11 @@ export class GateConfirmComponent implements Component {
     this.theme = opts.theme;
     this.data = opts.data;
     this.onDone = opts.onDone;
+    this.options = [
+      { key: "n", label: opts.data.rejectLabel ?? "阻止（默认）", outcome: "rejected" },
+      { key: "y", label: opts.data.onceLabel ?? "允许一次", outcome: "allowed-once" },
+    ];
+    if (opts.data.allowSession !== false) this.options.push({ key: "a", label: "本会话允许", outcome: "allowed-session" });
   }
 
   handleInput(data: string): void {
@@ -63,10 +69,11 @@ export class GateConfirmComponent implements Component {
     else if (matchesKey(data, "left")) this.moveSelection(-1);
     else if (matchesKey(data, "right")) this.moveSelection(1);
     else if (matchesKey(data, "return")) {
-      this.finish(GateConfirmComponent.OPTIONS[this.selectedIndex]?.outcome ?? "rejected");
-    } else if (data === "n" || data === "N") this.finish("rejected");
-    else if (data === "y" || data === "Y") this.finish("allowed-once");
-    else if (data === "a" || data === "A") this.finish("allowed-session");
+      this.finish(this.options[this.selectedIndex]?.outcome ?? "rejected");
+    } else {
+      const option = this.options.find(option => option.key === data.toLowerCase());
+      if (option) this.finish(option.outcome);
+    }
   }
 
   render(width: number): string[] {
@@ -91,7 +98,7 @@ export class GateConfirmComponent implements Component {
   private moveSelection(delta: number): void {
     if (this.finished) return;
     const next = this.selectedIndex + delta;
-    if (next < 0 || next >= GateConfirmComponent.OPTIONS.length || next === this.selectedIndex) return;
+    if (next < 0 || next >= this.options.length || next === this.selectedIndex) return;
     this.selectedIndex = next;
     this.tui?.requestRender();
   }
@@ -103,7 +110,7 @@ export class GateConfirmComponent implements Component {
   }
 
   private renderCommandLines(width: number, sev: "error" | "warning"): string[] {
-    const { preview, danger } = this.data;
+    const { preview, danger, additionalDangers = [] } = this.data;
     const digits = String(Math.max(preview.totalLines, preview.lines.length)).length;
     const out: string[] = [];
     preview.lines.forEach((line, i) => {
@@ -117,21 +124,24 @@ export class GateConfirmComponent implements Component {
         shownEnd = line.start + cut.length;
       }
       // 危险区间与本行可见区间求交；映射到（可能截断后的）行内偏移。
-      const spanStart = Math.max(danger.start, line.start);
-      const spanEnd = Math.min(danger.end, shownEnd);
-      let content: string;
-      if (spanStart < spanEnd) {
-        const relStart = Math.min(spanStart - line.start, text.length);
-        const relEnd = Math.min(spanEnd - line.start, text.length);
-        // 反白：语义色只允许作 fg token，作背景时取具体色（文档建议的写法）。
-        const invertBg = sev === "error" ? this.theme.colors.error : this.theme.colors.warning;
-        content =
-          text.slice(0, relStart) +
-          this.theme.style(text.slice(relStart, relEnd), { bg: invertBg, bold: true }) +
-          text.slice(relEnd);
-      } else {
-        content = text;
+      const spans = [danger, ...additionalDangers].map(span => ({
+        start: Math.max(span.start, line.start) - line.start,
+        end: Math.min(span.end, shownEnd) - line.start,
+      })).filter(span => span.start < span.end).sort((a, b) => a.start - b.start);
+      const merged: typeof spans = [];
+      for (const span of spans) {
+        const last = merged[merged.length - 1];
+        if (last && span.start <= last.end) last.end = Math.max(last.end, span.end);
+        else merged.push({ ...span });
       }
+      const invertBg = sev === "error" ? this.theme.colors.error : this.theme.colors.warning;
+      let content = "";
+      let offset = 0;
+      for (const span of merged) {
+        content += text.slice(offset, span.start) + this.theme.style(text.slice(span.start, span.end), { bg: invertBg, bold: true });
+        offset = span.end;
+      }
+      content += text.slice(offset);
       out.push(prefix + content);
     });
     return out;
@@ -152,7 +162,7 @@ export class GateConfirmComponent implements Component {
   private renderKeysLine(sev: "error" | "warning"): string {
     const dim = (s: string) => this.theme.fg("dim", s);
     const chips: string[] = [];
-    GateConfirmComponent.OPTIONS.forEach((option, i) => {
+    this.options.forEach((option, i) => {
       const chip = `[${option.key}] ${option.label}`;
       chips.push(i === this.selectedIndex ? this.theme.style(chip, { fg: sev, bold: true }) : dim(chip));
     });

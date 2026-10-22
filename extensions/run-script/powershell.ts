@@ -1,26 +1,19 @@
-import { execFile, spawn } from "node:child_process";
-import { basename } from "node:path";
+import { inspectPowerShellAst } from "../shared/powershell-analysis.js";
+export { resolvePowerShell7 } from "../shared/powershell-analysis.js";
 
-/** Resolve and validate the actual interpreter on every call; overrides may only select Core 7+. */
-export async function resolvePowerShell7(env: NodeJS.ProcessEnv = process.env, signal?: AbortSignal): Promise<string> {
-  signal?.throwIfAborted();
-  const executable = env.PI_POWERSHELL_EXE?.trim() || "pwsh.exe";
-  if (/^powershell(?:\.exe)?$/i.test(basename(executable))) {
-    throw new Error("Windows PowerShell 5.1 is unsupported. Use pwsh 7+; PI_POWERSHELL_EXE must point to pwsh.");
+/** Normalize only the optional UTF-8 BOM. Never replace malformed bytes or
+ * guess an encoding; NUL-containing sources also reject BOM-less UTF-16/32. */
+export function decodePowerShellSource(bytes: Uint8Array): string {
+  let source: string;
+  try {
+    source = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    throw new Error("PowerShell source must be valid UTF-8 (with or without BOM). Save explicitly as UTF-8 before retrying; no encoding conversion was performed.");
   }
-  return new Promise((resolve, reject) => {
-    execFile(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
-      "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); [Console]::WriteLine(('{0}|{1}|{2}' -f $PSVersionTable.PSEdition, $PSVersionTable.PSVersion.Major, ([IO.Path]::Combine($PSHOME, 'pwsh.exe'))))"],
-    { env, signal, timeout: 10_000, windowsHide: true, encoding: "utf8" }, (error, stdout) => {
-      if (error) { reject(error); return; }
-      const match = /^Core\|(\d+)\|(.+)$/m.exec(stdout.trim());
-      if (!match || Number(match[1]) < 7) {
-        reject(new Error("PowerShell Core 7+ is required; the configured interpreter failed version validation."));
-      } else {
-        resolve(match[2].trim());
-      }
-    });
-  });
+  if (source.includes("\0")) {
+    throw new Error("PowerShell source contains NUL bytes; UTF-16/UTF-32 and binary source files are not supported. Save explicitly as UTF-8 before retrying; no encoding conversion was performed.");
+  }
+  return source;
 }
 
 /** Embedded in the AST checker. Only executable command positions are inspected:
@@ -77,17 +70,6 @@ $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.CommandAs
 /** Validate literal legacy invocations and report direct WSL invocations for
  * client-tree execution; WSL brokers cannot use ordinary Job completion. */
 export async function assertNoLegacyInvocation(source: string, executable: string, env: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<boolean> {
-  const checker = "[Console]::InputEncoding = [Text.UTF8Encoding]::new($false); [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $PSModuleAutoLoadingPreference = 'None'; Import-Module ([IO.Path]::Combine($PSHOME, 'Modules', 'Microsoft.PowerShell.Utility', 'Microsoft.PowerShell.Utility.psd1')) -ErrorAction Stop; $ast = [System.Management.Automation.Language.Parser]::ParseInput([Console]::In.ReadToEnd(), [ref]$null, [ref]$null);\n" + LEGACY_COMMAND_CHECK + "\nif ($legacy) { exit 1 }; $hasWsl = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.CommandAst] -and $a.GetCommandName() -and (($a.GetCommandName() -split '[\\\\/]')[-1] -match '^wsl(\\.exe)?$') }, $true).Count -gt 0; if ($hasWsl) { [Console]::WriteLine('PI_DIRECT_WSL') }";
-  return await new Promise<boolean>((resolve, reject) => {
-    const child = spawn(executable, ["-NoProfile", "-NonInteractive", "-Command", checker], {
-      env, signal, timeout: 30_000, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
-    });
-    let output = "";
-    child.stdout.setEncoding("utf8").on("data", (chunk: string) => { output += chunk; });
-    child.stderr.setEncoding("utf8").on("data", (chunk: string) => { output += chunk; });
-    child.on("error", reject);
-    child.stdin.on("error", reject);
-    child.on("close", code => code === 0 ? resolve(output.includes("PI_DIRECT_WSL")) : reject(new Error(output.trim() || "PowerShell invocation check failed")));
-    child.stdin.end(source, "utf8");
-  });
+  const output = await inspectPowerShellAst(source, LEGACY_COMMAND_CHECK + "\nif ($legacy) { exit 1 }; $hasWsl = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.CommandAst] -and $a.GetCommandName() -and (($a.GetCommandName() -split '[\\\\/]')[-1] -match '^wsl(\\.exe)?$') }, $true).Count -gt 0; if ($hasWsl) { [Console]::WriteLine('PI_DIRECT_WSL') }", executable, env, signal);
+  return output.includes("PI_DIRECT_WSL");
 }

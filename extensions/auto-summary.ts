@@ -11,10 +11,12 @@ import {
 } from "@earendil-works/pi-coding-agent";
 
 import { assistantText, commandModel, commandOperation, completeCommand } from "./shared/model-call.js";
+import { buildTopicDigest, dropSlashCommandMessages, generateSessionName } from "./shared/session-name.js";
 export { recordSummaryUsage } from "./shared/model-call.js";
 
 const MAX_FILENAME_BASE_LENGTH = 40;
-const MAX_GENERATED_OUTPUT_TOKENS = 16_384;
+// Input budgeting only: Pi may use more output room when the conversation is short.
+const OUTPUT_TOKEN_RESERVE = 16_384;
 const PROMPT_TOKEN_RESERVE = 4096;
 const MAX_WRITE_ATTEMPTS = 10_000;
 const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i;
@@ -61,7 +63,7 @@ const sanitizeFilenameBase = (value: string): string => {
     .replace(/^[. -]+|[. -]+$/g, "")
     .trim();
 
-  let base = (sanitized || "模型输出").slice(0, MAX_FILENAME_BASE_LENGTH).replace(/[. -]+$/g, "");
+  let base = Array.from(sanitized || "模型输出").slice(0, MAX_FILENAME_BASE_LENGTH).join("").replace(/[. -]+$/g, "");
   if (!base) {
     base = "模型输出";
   }
@@ -84,10 +86,12 @@ const nextVersion = async (dir: string, base: string): Promise<number> => {
   return versions.length > 0 ? Math.max(...versions) + 1 : 1;
 };
 
-const writeVersionedMarkdown = async (dir: string, base: string, content: string): Promise<string> => {
+const writeVersionedMarkdown = async (dir: string, base: string, content: string, signal: AbortSignal): Promise<string> => {
+  signal.throwIfAborted();
   let version = await nextVersion(dir, base);
 
   for (let attempt = 0; attempt < MAX_WRITE_ATTEMPTS; attempt += 1, version += 1) {
+    signal.throwIfAborted();
     const filePath = join(dir, `${base}-v${version}.md`);
     try {
       await writeFile(filePath, content.endsWith("\n") ? content : `${content}\n`, {
@@ -105,11 +109,9 @@ const writeVersionedMarkdown = async (dir: string, base: string, content: string
   throw new Error("无法分配可用的 Markdown 文件版本号");
 };
 
-const findLatestAssistantText = (ctx: ExtensionCommandContext): string | undefined => {
-  const sessionContext = buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId());
-
-  for (let index = sessionContext.messages.length - 1; index >= 0; index -= 1) {
-    const message = sessionContext.messages[index];
+const findLatestAssistantText = (messages: ReturnType<typeof buildSessionContext>["messages"]): string | undefined => {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
     if (message.role !== "assistant") {
       continue;
     }
@@ -123,9 +125,12 @@ const findLatestAssistantText = (ctx: ExtensionCommandContext): string | undefin
   return undefined;
 };
 
-const markdownHeading = (content: string): string | undefined => {
-  const heading = content.match(/^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$/m)?.[1]?.trim();
-  return heading || undefined;
+/** Only generated documents receive a fixed heading; saving a reply preserves its text. */
+const withDocumentTitle = (content: string, title: string): string => {
+  const heading = `# ${title.replace(/\s+/g, " ").trim()}`;
+  return /^#[ \t]+[^\r\n]*(?:\r?\n|$)/.test(content)
+    ? content.replace(/^#[ \t]+[^\r\n]*/, () => heading)
+    : `${heading}\n\n${content}`;
 };
 
 type SummaryMode =
@@ -139,13 +144,13 @@ const parseMode = (args: string): SummaryMode => {
   return { mode: "generate", instructions: trimmed };
 };
 
-const buildDocumentPrompt = (conversationText: string, instructions?: string): string =>
+const buildDocumentPrompt = (conversationText: string, title: string, instructions?: string): string =>
   [
     "你是当前 Pi 会话使用的文档整理模型。请把下面当前分支的会话内容整理成一份完整、可独立阅读的 Markdown 文档。",
     "这不是简短概况：应保留对读者有价值的结论、解释、步骤、代码或配置示例、命令、路径、关键决策、验证结果、限制和后续事项。",
     "根据实际内容组织章节，删除无意义的往返对话和重复信息，但不要遗漏完成任务所需的重要细节，也不要编造未发生的操作。",
     "只输出 Markdown 正文，不要 JSON，不要在整篇文档外包裹代码围栏，不要解释你正在整理文档。",
-    "第一行使用准确的一级标题（# 标题），标题也将用于生成文件名。",
+    `第一行使用给定的一级标题：${JSON.stringify(`# ${title.replace(/\s+/g, " ").trim()}`)}。保留该标题，不要另起名字。`,
     instructions ? `用户附加整理要求：${instructions}` : undefined,
     "",
     "<session>",
@@ -189,6 +194,7 @@ const prepareConversation = (conversationText: string, model: Model<any>, output
 
 const generateDocument = async (
   conversationText: string,
+  title: string,
   instructions: string | undefined,
   ctx: ExtensionCommandContext,
   pi: ExtensionAPI,
@@ -200,8 +206,9 @@ const generateDocument = async (
     return undefined;
   }
 
-  const maxTokens = Math.max(1, Math.min(MAX_GENERATED_OUTPUT_TOKENS, model.maxTokens));
-  const prepared = prepareConversation(conversationText, model, maxTokens);
+  // Pi clamps the model's output allowance to the actual request's context room.
+  const maxTokens = Math.max(1, model.maxTokens);
+  const prepared = prepareConversation(conversationText, model, Math.min(OUTPUT_TOKEN_RESERVE, maxTokens));
   if (prepared.truncated) {
     ctx.ui.notify(
       `/summary 会话约 ${prepared.estimatedTokens} tokens，超过生成输入预算 ${prepared.inputTokenBudget}，已保留开头和最近内容`,
@@ -211,7 +218,7 @@ const generateDocument = async (
 
   ctx.ui.notify(`/summary 正在使用 ${model.provider}/${model.id} 生成完整 Markdown 文档...`, "info");
 
-  const response = await completeCommand(pi, ctx.modelRegistry, model, buildDocumentPrompt(prepared.text, instructions), maxTokens, signal);
+  const response = await completeCommand(pi, ctx.modelRegistry, model, buildDocumentPrompt(prepared.text, title, instructions), maxTokens, signal);
   if (signal.aborted || response.stopReason === "aborted") return undefined;
   if (response.stopReason === "error") {
     throw new Error(`模型生成失败（${response.stopReason}）：${response.errorMessage ?? "无错误详情"}`);
@@ -224,67 +231,89 @@ const generateDocument = async (
   if (response.stopReason === "length") {
     ctx.ui.notify("/summary 模型输出达到 maxTokens 上限，保存的文档可能不完整", "warning");
   }
-  return text;
+  return withDocumentTitle(text, title);
 };
 
 export default function (pi: ExtensionAPI) {
-  const operation = commandOperation(pi, "/summary 正在生成，请先等待或按 Esc 取消后再切换会话/分支");
+  const operation = commandOperation(pi, "/summary 正在处理，请先等待或按 Esc 取消后再切换会话/分支");
   pi.registerCommand("summary", {
     description: "无参数保存最近一次助手回复；/summary [要求] 用当前模型生成完整会话文档",
     handler: async (args, ctx) => {
       await ctx.waitForIdle();
       if (operation.isPending()) {
-        ctx.ui.notify("/summary 正在生成，请先等待或按 Esc 取消", "warning");
+        ctx.ui.notify("/summary 正在处理，请先等待或按 Esc 取消", "warning");
         return;
       }
 
       try {
         const requested = parseMode(args);
-
+        const sessionContext = buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId());
+        let savedReply: string | undefined;
+        let conversationText = "";
         if (requested.mode === "save") {
-          const content = findLatestAssistantText(ctx);
-          if (!content) {
+          savedReply = findLatestAssistantText(sessionContext.messages);
+          if (!savedReply) {
             ctx.ui.notify("/summary 当前分支没有可保存的助手文本回复", "warning");
             return;
           }
-
-          const base = sanitizeFilenameBase(
-            markdownHeading(content) || pi.getSessionName() || "模型输出",
-          );
-          const filePath = await writeVersionedMarkdown(ctx.cwd, base, content);
-          ctx.ui.notify(`已保存最近一次助手回复：${filePath}`, "info");
-          return;
+        } else {
+          conversationText = serializeConversation(convertToLlm(sessionContext.messages));
+          if (!conversationText.trim()) {
+            ctx.ui.notify("/summary 当前分支没有可生成文档的会话内容", "warning");
+            return;
+          }
         }
 
-        const sessionContext = buildSessionContext(ctx.sessionManager.getEntries(), ctx.sessionManager.getLeafId());
-        const conversationText = serializeConversation(convertToLlm(sessionContext.messages));
-        if (!conversationText.trim()) {
-          ctx.ui.notify("/summary 当前分支没有可生成文档的会话内容", "warning");
-          return;
-        }
-
+        const existingName = pi.getSessionName();
         const controller = operation.begin();
-        let content: string | undefined;
+        type PreparedDocument = { title: string; content: string };
+        const prepareDocument = async (): Promise<PreparedDocument | undefined> => {
+          let title = existingName;
+          if (!title) {
+            const digest = buildTopicDigest(dropSlashCommandMessages(sessionContext.messages));
+            if (digest.userInputs.length === 0 && !digest.firstReply) {
+              throw new Error("当前分支没有可命名的会话内容");
+            }
+            const model = commandModel(ctx, sessionContext.model);
+            if (!model) throw new Error("未找到当前模型，无法生成标题");
+            ctx.ui.notify(`/summary 正在用 ${model.provider}/${model.id} 生成标题...`, "info");
+            title = await generateSessionName(pi, ctx.modelRegistry, model, digest, controller.signal, "auto-summary");
+            if (!title || controller.signal.aborted) return undefined;
+          }
+          const content = requested.mode === "save"
+            ? savedReply
+            : await generateDocument(conversationText, title, requested.instructions, ctx, pi, controller.signal);
+          return content ? { title, content } : undefined;
+        };
         try {
-          if (ctx.mode === "tui") {
-            const result = await ctx.ui.custom<{ text?: string; error?: unknown }>((tui, theme, _keys, done) => {
-              const loader = new BorderedLoader(tui, theme, "生成会话文档（Esc 取消）");
+          let prepared: PreparedDocument | undefined;
+          if (ctx.mode === "tui" && (!existingName || requested.mode === "generate")) {
+            const result = await ctx.ui.custom<{ document?: PreparedDocument; error?: unknown }>((tui, theme, _keys, done) => {
+              const loader = new BorderedLoader(tui, theme, requested.mode === "save"
+                ? "生成标题并保存回复（Esc 取消）" : "生成标题与会话文档（Esc 取消）");
               loader.onAbort = () => controller.abort();
               // Wait for cancellation settlement so billed partial usage is
               // recorded before the command/session is allowed to move on.
-              void generateDocument(conversationText, requested.instructions, ctx, pi, controller.signal)
-                .then(text => done({ text }), error => done({ error }));
+              void prepareDocument().then(document => done({ document }), error => done({ error }));
               return loader;
             });
             if (result.error && !controller.signal.aborted) throw result.error;
-            content = result.text;
+            prepared = result.document;
           } else {
-            content = await generateDocument(conversationText, requested.instructions, ctx, pi, controller.signal);
+            prepared = await prepareDocument();
           }
-          if (controller.signal.aborted) {
+          if (controller.signal.aborted || !prepared) {
             ctx.ui.notify("/summary 已取消", "info");
             return;
           }
+          const base = sanitizeFilenameBase(prepared.title);
+          const filePath = await writeVersionedMarkdown(ctx.cwd, base, prepared.content, controller.signal);
+          // Persist a generated name only after a successful save. Preserve a
+          // name supplied by another command while the request was pending.
+          if (!existingName && !controller.signal.aborted && !pi.getSessionName()) {
+            pi.setSessionName(prepared.title);
+          }
+          ctx.ui.notify(`${requested.mode === "save" ? "已保存最近一次助手回复" : "已生成完整 Markdown 文档"}：${filePath}`, "info");
         } catch (error) {
           if (!controller.signal.aborted) throw error;
           ctx.ui.notify("/summary 已取消", "info");
@@ -292,11 +321,6 @@ export default function (pi: ExtensionAPI) {
         } finally {
           operation.finish(controller);
         }
-        if (!content) return;
-
-        const base = sanitizeFilenameBase(markdownHeading(content) || pi.getSessionName() || "会话文档");
-        const filePath = await writeVersionedMarkdown(ctx.cwd, base, content);
-        ctx.ui.notify(`已生成完整 Markdown 文档：${filePath}`, "info");
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         ctx.ui.notify(`/summary 失败：${message}`, "error");

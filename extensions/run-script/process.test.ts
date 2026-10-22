@@ -34,11 +34,36 @@ try {
     const descendant = `setTimeout(()=>require('node:fs').writeFileSync(${JSON.stringify(marker)},'escaped'),3500)`;
     // The root exits immediately, before cancellation. Its child retains output
     // handles and stays owned by the runner's Job rather than the dead root PID.
-    const parent = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{detached:true,stdio:['ignore','inherit','inherit']}).unref();console.log('root-exited');process.exit(0)`;
-    const result = await run(parent, { timeoutMs: 2500 });
-    assert.equal(result.timedOut, true, result.output);
-    assert.match(result.output, /root-exited/);
-    await new Promise(resolve => setTimeout(resolve, 2500));
+    const parent = `require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{detached:true,stdio:['ignore','inherit','inherit']}).unref();console.log('root-exited:'+process.pid);process.exit(0)`;
+    // Job runner startup can exceed 2.5 s on Windows. Cancel only after the
+    // payload reports readiness and its root PID has actually exited.
+    const controller = new AbortController();
+    let ready: (pid: number) => void = () => {};
+    const started = new Promise<number>(resolve => { ready = resolve; });
+    const settled = run(parent, { timeoutMs: 10000, signal: controller.signal,
+      onUpdate: text => { const match = /root-exited:(\d+)/.exec(text); if (match) ready(Number(match[1])); },
+    }).then(result => ({ result, error: undefined }), error => ({ result: undefined, error }));
+    const pid = await Promise.race([started, settled.then(outcome => {
+      throw outcome.error ?? new Error(`Parent finished before readiness: ${outcome.result?.output}`);
+    })]);
+    const deadline = Date.now() + 2000;
+    let rootExited = false;
+    while (Date.now() < deadline) {
+      try { process.kill(pid, 0); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        rootExited = true;
+        break;
+      }
+      await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    controller.abort();
+    const outcome = await settled;
+    assert.equal(rootExited, true, "root process exited before cancellation");
+    assert.ok(outcome.error instanceof ProcessExecutionError);
+    assert.equal(outcome.error.outcome.execution.status, "cancelled");
+    assert.match(outcome.error.outcome.output, /root-exited/);
+    await new Promise(resolve => setTimeout(resolve, 4000));
     assert.equal(existsSync(marker), false, "child cannot outlive cancellation after its root exited");
   }
   const cancelled = new AbortController();

@@ -6,18 +6,17 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { InMemoryCredentialStore, InMemoryModelsStore } from "@earendil-works/pi-ai";
-import { createAgentSession, createEventBus, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { registerPluginManager } from "../plugin-manager.js";
 import { ConfigService } from "./config.js";
-import { readToolContracts, registerManagedTool } from "../shared/managed-tools.js";
+import { SelectionState } from "./state.js";
 
 const root = await mkdtemp(join(tmpdir(), "pi-plugin-runtime-"));
 const agentDir = join(root, "agent"); const cwd = join(root, "project");
 const historical = process.env.PI_PLUGIN_MANAGER_TEST_SESSION ?? "";
 const original = existsSync(historical) ? await readFile(historical) : undefined;
 const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
-const helper = fileURLToPath(new URL("../shared/managed-tools.ts", import.meta.url)).replace(/\\/g, "/");
 const builtins = ["read", "bash", "edit", "write"];
 const put = async (path: string, value: unknown) => writeFile(path, JSON.stringify(value), "utf8");
 const fetchBefore = globalThis.fetch;
@@ -28,11 +27,10 @@ try {
   await mkdir(join(cwd, ".pi", "extensions"), { recursive: true });
   await writeFile(join(agentDir, "extensions", "managed.ts"), `
     import { Type } from "typebox";
-    import { registerManagedTool } from ${JSON.stringify(helper)};
     export default pi => {
       for (const spec of [{name:"run-script"}, {name:"web_search"}, {name:"web_fetch"},
         {name:"optional_tool", defaultActive:false}, {name:"deferred_tool", exposure:"deferred"}]) {
-        registerManagedTool(pi, {...spec, label:spec.name, description:"offline fixture", parameters:Type.Object({}),
+        pi.registerTool( {...spec, label:spec.name, description:"offline fixture", parameters:Type.Object({}),
           async execute(){ throw new Error("History replay must never execute a tool"); }});
       }
       pi.registerTool({name:"unknown_tool",label:"unknown",description:"no auto contract",parameters:Type.Object({}),
@@ -40,13 +38,12 @@ try {
     }`, "utf8");
   await writeFile(join(cwd, ".pi", "extensions", "project.ts"), `
     import { Type } from "typebox";
-    import { registerManagedTool } from ${JSON.stringify(helper)};
-    export default pi => registerManagedTool(pi, {name:"project_tool",label:"project",description:"project fixture",parameters:Type.Object({}),
+    export default pi => pi.registerTool( {name:"project_tool",label:"project",description:"project fixture",parameters:Type.Object({}),
       async execute(){ throw new Error("Must not execute"); }});`, "utf8");
   const modelRuntime = await ModelRuntime.create({ modelsPath: null, credentials: new InMemoryCredentialStore(),
     modelsStore: new InMemoryModelsStore(), allowModelNetwork: false, refreshOnCreate: false });
   const model = modelRuntime.getModels()[0]; assert.ok(model);
-  type Scenario = { name: string; mode?: "auto" | "default"; argv?: string[]; tools?: string[]; excludeTools?: string[]; noTools?: boolean; defaultTools?: string[]; removed?: boolean; actual?: boolean };
+  type Scenario = { name: string; mode?: "auto" | "default"; tools?: string[]; excludeTools?: string[]; noTools?: boolean; defaultTools?: string[]; removed?: boolean; actual?: boolean };
   async function run(scenario: Scenario) {
     await put(join(agentDir, "settings.json"), scenario.defaultTools ? { defaultTools: scenario.defaultTools } : {});
     await put(join(agentDir, "plugin-manager.json"), { version: 1, mode: scenario.mode ?? "auto", saveTarget: "project" });
@@ -62,7 +59,7 @@ try {
     if (scenario.removed) manager.appendMessage({ role: "system", content: "deliberate tool removal", timestamp: Date.now(), toolsRemoved: [{ name: "run-script" }] });
     const settingsManager = SettingsManager.inMemory(scenario.defaultTools ? { defaultTools: scenario.defaultTools } : {}, { projectTrusted: true });
     const loader = new DefaultResourceLoader({ cwd, agentDir, settingsManager, noSkills: true, noThemes: true, noPromptTemplates: true, noContextFiles: true,
-      extensionFactories: [{ name: "manager-under-test", factory: pi => registerPluginManager(pi, { agentDir, argv: scenario.argv ?? [] }) }] });
+      extensionFactories: [{ name: "manager-under-test", factory: pi => registerPluginManager(pi, { agentDir }) }] });
     await loader.reload();
     assert.equal(loader.getExtensions().errors.length, 0, "fixtures and manager must load without errors");
     const { session } = await createAgentSession({ cwd, agentDir, modelRuntime, model, sessionManager: manager, settingsManager, resourceLoader: loader,
@@ -76,15 +73,11 @@ try {
       assert.deepEqual(errors, [], `${scenario.name}: no extension errors`);
       const audit = manager.getEntries().filter(entry => entry.type === "custom" && entry.customType === "plugin-manager-tools");
       const delta = after.filter(name => !before.includes(name));
-      if (scenario.mode === "default" || scenario.noTools) assert.deepEqual(delta, [], scenario.name);
-      else {
-        assert.equal(after.includes("run-script"), !scenario.removed && !scenario.tools?.includes("-run-script") &&
-          !scenario.excludeTools?.includes("run-script") && scenario.defaultTools === undefined && !scenario.tools?.includes("read"), scenario.name);
-        for (const name of ["optional_tool", "unknown_tool", "project_tool", "deferred_tool"]) {
-          assert.equal(delta.includes(name), false, `${scenario.name}: must not auto-add ${name}`);
-        }
-      }
-      if (!delta.length) assert.equal(audit.length, 0, `${scenario.name}: no invented auto audit`);
+      assert.deepEqual(delta, [], scenario.name + ": manager never activates tools");
+      assert.equal(audit.length, 0, scenario.name + ": manager writes no activation audit");
+      assert.equal(after.includes("run-script"), !scenario.noTools && !scenario.removed && !scenario.tools?.includes("-run-script") &&
+        !scenario.excludeTools?.includes("run-script") && !scenario.tools?.includes("read"), scenario.name);
+      assert.equal(after.includes("optional_tool"), false, scenario.name + ": opt-in stays inactive");
       const activeBeforeStatus = [...after];
       const command = session.extensionRunner.getRegisteredCommands().find(command => command.name === "plugins"); assert.ok(command);
       await command.handler("status", session.extensionRunner.createCommandContext());
@@ -100,10 +93,10 @@ try {
   }
   await run({ name: "default", mode: "default" });
   await run({ name: "auto" });
-  await run({ name: "explicit-minus", tools: ["-run-script"], argv: ["--tools", "-run-script"] });
-  await run({ name: "excluded", excludeTools: ["run-script"], argv: ["--exclude-tools", "run-script"] });
-  await run({ name: "allowlist", tools: ["read", "bash"], argv: ["--tools", "read,bash"] });
-  await run({ name: "no-tools", noTools: true, argv: ["--no-tools"] });
+  await run({ name: "explicit-minus", tools: ["-run-script"] });
+  await run({ name: "excluded", excludeTools: ["run-script"] });
+  await run({ name: "allowlist", tools: ["read", "bash"] });
+  await run({ name: "no-tools", noTools: true });
   await run({ name: "default-tools", defaultTools: builtins });
   await run({ name: "historically-removed", removed: true });
   if (original) {
@@ -115,7 +108,7 @@ try {
     console.log("Actual historical session copy passed; original SHA-256 unchanged.");
   } else console.log("No optional session supplied; historical fixtures covered instead.");
   {
-    // Exercise the shipped wrappers with isolated settings/auth and a historical tool list.
+    // Load the shipped wrappers with isolated config/auth and a synthetic old declaration.
     const realAgent = join(root, "real-agent"); const realCwd = join(root, "real-project");
     await mkdir(realAgent, { recursive: true }); await mkdir(realCwd, { recursive: true });
     const entries = ["web-search.ts", "powershell-bash.ts", "write-transforms.ts", "permission-gate.ts"].map(name => fileURLToPath(new URL(`../${name}`, import.meta.url)));
@@ -124,7 +117,7 @@ try {
     const realSettings = SettingsManager.inMemory({ extensions: entries }, { projectTrusted: true });
     const realLoader = new DefaultResourceLoader({ cwd: realCwd, agentDir: realAgent, settingsManager: realSettings,
       noSkills: true, noThemes: true, noPromptTemplates: true, noContextFiles: true,
-      extensionFactories: [{ name: "manager", factory: pi => registerPluginManager(pi, { agentDir: realAgent, argv: [] }) }] });
+      extensionFactories: [{ name: "manager", factory: pi => registerPluginManager(pi, { agentDir: realAgent }) }] });
     await realLoader.reload(); assert.deepEqual(realLoader.getExtensions().errors, []);
     const realManager = SessionManager.inMemory(realCwd);
     realManager.appendMessage({ role: "system", content: "historical four-tool fixture", timestamp: Date.now(),
@@ -141,35 +134,30 @@ try {
       const read = session.resourceLoader.getExtensions().extensions.flatMap(extension => [...extension.tools.values()]).find(tool => tool.definition.name === "read");
       assert.ok(read, "the real guarded read wrapper remains registered");
       assert.ok(session.extensionRunner.hasHandlers("tool_call"), "permission hooks remain installed");
-      console.log(`Historical fixture with shipped wrappers: ${active.join(",")}; powershell remains opt-in, permission/read hooks retained.`);
+      console.log(`Synthetic old declaration with shipped wrappers: ${active.join(",")}; powershell remains opt-in, permission/read hooks retained.`);
     } finally { await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" }); session.dispose(); }
   }
 
-  // Late disk reads cannot activate tools in a replacement/shutdown runtime.
+  // A late inventory load must not notify or open UI after shutdown.
   const handlers = new Map<string, (event: unknown, ctx: any) => unknown>();
-  const events = createEventBus(); let activated = 0;
-  const mock = { on(name: string, handler: any) { handlers.set(name, handler); }, events,
-    registerCommand() {}, registerTool() {}, getAllTools: () => [], getActiveTools: () => [], getSettings: () => ({}),
-    setActiveTools() { activated++; }, appendEntry() {} } as unknown as ExtensionAPI;
-  registerManagedTool(mock, { name: "fixture", label: "fixture", description: "fixture", parameters: Type.Object({}), async execute() { throw new Error("not called"); } });
-  assert.equal(readToolContracts(mock).get("fixture")?.defaultActive, true);
-  const contractShutdown = handlers.get("session_shutdown")!;
-  registerPluginManager(mock, { agentDir, argv: [] });
-  const originalSnapshot = ConfigService.prototype.snapshot;
-  let release!: (value: any) => void; let started!: () => void;
+  let command: any, notices = 0, activations = 0;
+  const mock = { on(name: string, handler: any) { handlers.set(name, handler); },
+    registerCommand(_name: string, definition: any) { command = definition; },
+    getActiveTools: () => [], setActiveTools() { activations++; } } as unknown as ExtensionAPI;
+  registerPluginManager(mock, { agentDir });
+  const originalOpen = ConfigService.prototype.open;
+  let release!: (value: SelectionState) => void, started!: () => void;
   const began = new Promise<void>(resolve => { started = resolve; });
-  ConfigService.prototype.snapshot = function () { started(); return new Promise(resolve => { release = resolve; }); };
+  ConfigService.prototype.open = function () { started(); return new Promise(resolve => { release = resolve; }); };
   try {
-    const ctx = { cwd, isProjectTrusted: () => true, ui: { notify() {} } };
+    const ctx = { cwd, mode: "json", waitForIdle: async () => {}, isProjectTrusted: () => true, ui: { notify() { notices++; } } };
     handlers.get("session_start")!({}, ctx);
-    const waiting = handlers.get("resources_discover")!({}, ctx);
-    await began;
+    const waiting = command.handler("status", ctx); await began;
     handlers.get("session_shutdown")!({}, ctx);
-    release({ items: [], preferences: { mode: "auto", saveTarget: "project" } }); await waiting;
-    assert.equal(activated, 0);
-    contractShutdown({}, ctx);
-    assert.equal(readToolContracts(mock).size, 0, "metadata listeners are removed on shutdown");
-  } finally { ConfigService.prototype.snapshot = originalSnapshot; }
+    release(new SelectionState({ items: [] }, "fixture")); await waiting;
+    assert.equal(notices, 0); assert.equal(activations, 0);
+  } finally { ConfigService.prototype.open = originalOpen; }
+
 } finally {
   globalThis.fetch = fetchBefore;
   assert.equal(networkRequests, 0, "old-session replay and discovery must issue no network requests");

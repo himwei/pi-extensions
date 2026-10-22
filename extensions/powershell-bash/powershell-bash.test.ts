@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import shellFactory from "../powershell-bash.js";
-import permissionFactory, { clearSessionAllowlist } from "../permission-gate.js";
+import permissionFactory from "../permission-gate.js";
 import { createPowerShellOperations } from "./operations.js";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 
@@ -28,7 +28,6 @@ permissionFactory({ on: (name: string, handler: any) => handlers.set(name, handl
   appendEntry: (type: string, data: unknown) => audit.push({ type, data }) } as any);
 const gate = handlers.get("tool_call")!;
 const ctx = { cwd: process.cwd(), hasUI: false, signal: new AbortController().signal };
-clearSessionAllowlist();
 for (const name of tools.keys()) {
   const secret = await gate({ toolName: name, input: { command: "Get-Content auth.json" }, toolCallId: "secret" }, ctx);
   assert.equal(secret.block, true, name);

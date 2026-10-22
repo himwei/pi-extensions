@@ -2,94 +2,106 @@ import assert from "node:assert/strict";
 import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import { createEventBus, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { ConfigService, readPreferences, savePreferences } from "./config.js";
+import { SettingsManager } from "@earendil-works/pi-coding-agent";
+import { ConfigService } from "./config.js";
 
 const root = await mkdtemp(join(tmpdir(), "pi-plugin-config-"));
-const agentDir = join(root, "agent"); const cwd = join(root, "project");
-const globalPath = join(agentDir, "settings.json"); const projectPath = join(cwd, ".pi", "settings.json");
+const agentDir = join(root, "agent"), cwd = join(root, "project");
+const globalPath = join(agentDir, "settings.json"), projectPath = join(cwd, ".pi", "settings.json");
 const preferencesPath = join(agentDir, "plugin-manager.json");
-const pi = { getAllTools: () => [], getActiveTools: () => [], events: createEventBus() } as Pick<ExtensionAPI, "getAllTools" | "getActiveTools" | "events">;
 const json = async (path: string) => JSON.parse(await readFile(path, "utf8"));
 const put = async (path: string, value: unknown) => { await mkdir(join(path, ".."), { recursive: true }); await writeFile(path, JSON.stringify(value), "utf8"); };
-const service = (trusted = true) => new ConfigService(cwd, agentDir, trusted, pi);
-const missing = async (path: string) => { try { await readFile(path); return false; } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT"; } };
+const service = (trusted = true, current = () => true) => new ConfigService(cwd, agentDir, trusted, current);
 try {
-  await mkdir(join(agentDir, "extensions"), { recursive: true });
-  await mkdir(join(cwd, ".pi", "extensions"), { recursive: true });
+  await mkdir(join(agentDir, "extensions"), { recursive: true }); await mkdir(join(cwd, ".pi", "extensions"), { recursive: true });
   for (const name of ["foo", "bar"]) await writeFile(join(agentDir, "extensions", `${name}.ts`), "export default () => {};", "utf8");
   await writeFile(join(cwd, ".pi", "extensions", "local.ts"), "export default () => {};", "utf8");
   await put(globalPath, { theme: "dark", unrelated: { keep: true }, extensions: ["-extensions/foo.ts"] });
   await put(projectPath, { customProject: 7 });
   let state = await service().open();
-  const named = (name: string) => state.extensions.find(extension => extension.name === `${name}.ts`)!;
-  assert.equal(state.selected(named("foo")), false);
+  const named = (name: string) => { const entry = state.extensions.find(extension => extension.name === `${name}.ts`); assert.ok(entry, name); return entry; };
+  assert.equal(state.effective(named("foo")), false);
   assert.equal(named("local").source, "project");
-  assert.equal(await missing(preferencesPath), true, "opening never creates preferences");
-  state.toggle(named("foo")); state.saveTarget = "global"; await state.save();
-  assert.equal((await json(globalPath)).unrelated.keep, true);
-  assert.equal((await json(projectPath)).customProject, 7);
-  assert.equal(state.selected(named("foo")), true);
+  await assert.rejects(readFile(preferencesPath), { code: "ENOENT" });
+  state.toggle(named("foo"), "global"); await state.apply();
+  assert.equal((await json(globalPath)).unrelated.keep, true); assert.equal((await json(projectPath)).customProject, 7);
+  assert.equal(state.effective(named("foo")), true);
 
-  state = await service().open(); state.saveTarget = "project"; state.toggle(named("bar")); await state.save();
-  assert.equal(state.projectOverride(named("bar")), false);
-  assert.equal(state.selected(named("bar")), false);
-  assert.equal((await json(projectPath)).customProject, 7);
-  state.usePersonalDefault(named("bar")); await state.save();
-  assert.equal(state.projectOverride(named("bar")), undefined);
-  assert.equal(state.selected(named("bar")), true);
+  state = await service().open(); state.toggle(named("bar"), "project"); await state.apply();
+  assert.equal(state.selection(named("bar")).choice, "off"); assert.equal(state.effective(named("bar")), false);
+  state.inherit(named("bar")); await state.apply();
+  assert.equal(state.selection(named("bar")).choice, "inherit");
   assert.equal((await json(projectPath)).extensions.some((entry: string) => entry.includes("bar.ts")), false);
 
-  state.toggle(named("bar")); await state.save();
-  state.toggle(named("bar")); state.saveTarget = "global";
-  assert.equal(await state.save(), 1, "global saves preserve the existing project override and draft");
-  state.saveTarget = "project"; assert.equal(await state.save(), 0);
-  state.toggle(named("local")); state.saveTarget = "global"; state.autoAdd = true;
-  assert.equal(await state.save(), 1, "project-owned selections cannot be saved globally");
-  assert.equal((await readPreferences(preferencesPath)).mode, "auto");
-  assert.equal((await json(globalPath)).pluginManager, undefined, "preferences stay separate from native Pi settings");
+  // Explicit choices that match Global stay explicit when Global later changes.
+  state.toggle(named("bar"), "project"); state.toggle(named("bar"), "project"); await state.apply();
+  assert.equal(state.selection(named("bar")).choice, "on");
+  state.toggle(named("bar"), "global"); await state.apply();
+  assert.equal(state.selection(named("bar")).enabled, false); assert.equal(state.effective(named("bar")), true);
+  state.inherit(named("bar")); await state.apply(); assert.equal(state.effective(named("bar")), false);
+  state.toggle(named("foo"), "global"); state.toggle(named("local"), "project"); await state.apply();
+  assert.equal(state.count(), 0); assert.equal(state.selection(named("local")).choice, "off");
+  assert.equal(state.toggle(named("local"), "global"), false); assert.equal(state.inherit(named("local")), false);
 
-  state = await service().open(); state.toggle(named("foo"));
+  // Obsolete preferences are ignored, even when malformed, and never rewritten.
+  await writeFile(preferencesPath, "{obsolete broken preferences", "utf8");
+  state = await service().open(); state.toggle(named("foo"), "global");
   await put(globalPath, { ...(await json(globalPath)), theme: "light" });
-  await state.save(); assert.equal((await json(globalPath)).theme, "light", "unrelated external edits survive");
-  state = await service().open(); state.toggle(named("bar"));
-  await put(globalPath, { ...(await json(globalPath)), extensions: [...(await json(globalPath)).extensions, "-extensions/bar.ts"] });
-  await assert.rejects(state.save(), /changed externally/);
+  await state.apply(); assert.equal((await json(globalPath)).theme, "light");
+  assert.equal(await readFile(preferencesPath, "utf8"), "{obsolete broken preferences");
+  state = await service().open(); state.toggle(named("bar"), "project");
+  await put(globalPath, { ...(await json(globalPath)), extensions: [...(await json(globalPath)).extensions, "+extensions/bar.ts"] });
+  await assert.rejects(state.apply(), /changed externally/);
 
-  const preferences = await readPreferences(preferencesPath);
-  await put(preferencesPath, { version: 1, ...preferences, extra: "preserved" });
-  await savePreferences(preferencesPath, { ...preferences, mode: "default" }, preferences);
-  assert.equal((await json(preferencesPath)).extra, "preserved");
-  await assert.rejects(savePreferences(preferencesPath, preferences, preferences), /changed externally/);
-  await put(preferencesPath, { mode: "broken" });
-  await assert.rejects(service().open(), /Cannot read/);
-  await put(preferencesPath, { mode: "default", saveTarget: "project" });
-  state = await service(false).open(); state.toggle(named("foo"));
-  const beforeUntrusted = await readFile(projectPath, "utf8");
-  await assert.rejects(state.save(), /project trust/);
-  assert.equal(await readFile(projectPath, "utf8"), beforeUntrusted);
+  state = await service(false).open();
+  const projectBefore = await readFile(projectPath, "utf8");
+  assert.equal(state.toggle(named("foo"), "project"), false);
+  state.toggle(named("foo"), "global"); await state.apply();
+  assert.equal(await readFile(projectPath, "utf8"), projectBefore);
+  let current = true;
+  state = await service(true, () => current).open(); state.toggle(named("foo"), "global");
+  const globalBefore = await readFile(globalPath, "utf8"); current = false;
+  await assert.rejects(state.apply(), /old runtime/); assert.equal(await readFile(globalPath, "utf8"), globalBefore);
+
+  // A failure in the second native file preserves saved cells and pending drafts.
+  await put(globalPath, {}); await put(projectPath, {});
+  state = await service().open(); state.toggle(named("foo"), "global"); state.toggle(named("local"), "project");
+  const originalProjectSetter = SettingsManager.prototype.setProjectExtensionPaths;
+  let projectSets = 0;
+  SettingsManager.prototype.setProjectExtensionPaths = function (paths) {
+    // The first call validates the memory proposal; the second is the real save.
+    if (++projectSets === 2) throw new Error("Simulated project save failure");
+    originalProjectSetter.call(this, paths);
+  };
+  try { await assert.rejects(state.apply(), /Simulated project save failure/); }
+  finally { SettingsManager.prototype.setProjectExtensionPaths = originalProjectSetter; }
+  assert.equal(state.count("global"), 0); assert.equal(state.count("project"), 1);
+  assert.equal(state.reloadRequired, true); assert.equal(state.effective(named("foo")), false);
+  await state.apply(); assert.equal(state.count(), 0); assert.equal(state.selection(named("local")).choice, "off");
 
   const packageRoot = join(root, "package");
   await mkdir(join(packageRoot, "extensions"), { recursive: true });
   await put(join(packageRoot, "package.json"), { name: "fixture", pi: { extensions: ["./extensions"] } });
   for (const name of ["one", "two"]) await writeFile(join(packageRoot, "extensions", `${name}.ts`), "export default () => {};", "utf8");
-  await put(globalPath, { packages: [relative(agentDir, packageRoot)] });
-  await put(projectPath, { customProject: 7 });
-  state = await service().open(); state.saveTarget = "global"; state.toggle(named("one")); await state.save();
-  assert.equal(state.selected(named("one")), false);
-  assert.equal(state.selected(named("two")), true, "toggling one package resource preserves siblings");
-  state.saveTarget = "project"; state.toggle(named("two")); await state.save();
-  assert.equal(state.selected(named("two")), false);
-  assert.equal((await json(projectPath)).packages[0].autoload, false);
-  state.usePersonalDefault(named("two")); await state.save();
-  assert.equal(state.selected(named("two")), true);
-  assert.equal((await json(projectPath)).packages.length, 0);
-  await put(globalPath, { packages: [{ source: relative(agentDir, packageRoot), extensions: [] }] });
-  state = await service().open(); state.saveTarget = "global"; state.toggle(named("one")); await state.save();
-  assert.equal(state.selected(named("one")), true);
-  assert.equal(state.selected(named("two")), false, "an explicit empty filter remains disabled for siblings");
+  await put(globalPath, { packages: [relative(agentDir, packageRoot)] }); await put(projectPath, { customProject: 7 });
+  state = await service().open(); state.toggle(named("one"), "global"); await state.apply();
+  assert.equal(state.effective(named("one")), false); assert.equal(state.effective(named("two")), true);
+  state.toggle(named("two"), "project"); await state.apply();
+  assert.equal(state.effective(named("two")), false); assert.equal((await json(projectPath)).packages[0].autoload, false);
+  state.inherit(named("two")); await state.apply();
+  assert.equal(state.effective(named("two")), true); assert.equal((await json(projectPath)).packages.length, 0);
+  state.toggle(named("two"), "project"); state.toggle(named("two"), "project"); await state.apply();
+  assert.equal(state.selection(named("two")).choice, "on");
+  await put(globalPath, { packages: [{ source: relative(agentDir, packageRoot), extensions: [] }] }); await put(projectPath, {});
+  state = await service().open(); state.toggle(named("one"), "global"); await state.apply();
+  assert.equal(state.effective(named("one")), true); assert.equal(state.effective(named("two")), false);
+
+  // Pi ignores filters for a package source that is a single file: fail before writing.
+  await put(globalPath, { packages: [relative(agentDir, join(packageRoot, "extensions", "one.ts"))] });
+  state = await service().open(); state.toggle(named("one"), "global");
+  const unsupportedBefore = await readFile(globalPath, "utf8");
+  await assert.rejects(state.apply(), /native configuration/); assert.equal(await readFile(globalPath, "utf8"), unsupportedBefore);
   await writeFile(globalPath, "{broken", "utf8");
-  await assert.rejects(service().open(), /Repair Pi settings/);
-  assert.equal(await readFile(globalPath, "utf8"), "{broken");
-  console.log("plugin-manager: native discovery, selection saves, project inheritance, package deltas, preferences and stale-write checks passed");
+  await assert.rejects(service().open(), /Repair Pi settings/); assert.equal(await readFile(globalPath, "utf8"), "{broken");
+  console.log("plugin-manager: native discovery, two-scope saves, explicit inheritance, package deltas, stale runtime and configuration checks passed");
 } finally { await rm(root, { recursive: true, force: true }); }

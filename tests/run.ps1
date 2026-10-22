@@ -34,7 +34,12 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'TypeScript check failed' }
     foreach ($test in @(
         'extensions/web-search/config.test.ts', 'tests/package.test.ts',
+        'extensions/permission-gate/policy.test.ts', 'extensions/permission-gate/elevation.test.ts',
+        'extensions/permission-gate/authorization.test.ts', 'extensions/permission-gate/lifecycle.test.ts',
+        'extensions/permission-gate/approval.test.ts', 'extensions/permission-gate/dialog.test.ts',
         'extensions/plugin-manager/config.test.ts', 'extensions/plugin-manager/runtime.test.ts',
+        'extensions/ai-rename/ai-rename.test.ts', 'extensions/auto-summary/document.test.ts',
+        'extensions/auto-summary/naming.test.ts', 'extensions/tps-status/tps.test.ts',
         'extensions/write-transforms/matcher.test.ts', 'extensions/write-transforms/write-transforms.test.ts',
         'extensions/notify-dot/notify-dot.test.ts', 'extensions/notify-dot/focus-diagnostics.test.ts',
         'extensions/notify-dot/fullscreen-focus.test.ts',

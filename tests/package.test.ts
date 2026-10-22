@@ -22,6 +22,7 @@ try {
   mkdirSync(agentDir);
   mkdirSync(cwd);
   cpSync(join(repository, "extensions"), join(checkout, "extensions"), { recursive: true });
+  cpSync(join(repository, "skills"), join(checkout, "skills"), { recursive: true });
   cpSync(join(repository, "package.json"), join(checkout, "package.json"));
   renameSync(checkout, relocated);
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -36,6 +37,17 @@ try {
     cwd, agentDir, settingsManager: SettingsManager.inMemory({ packages: [relocated] }),
   });
   const resources = await manager.resolve();
+  const skills = resources.skills.filter((entry) => entry.enabled);
+  assert.equal(skills.length, 1, "the package exposes exactly the upgrade-review skill");
+  const skillPath = skills[0].path;
+  const skillDirectory = skillPath.endsWith("SKILL.md") ? resolve(skillPath, "..") : skillPath;
+  assert.equal(skillDirectory, join(relocated, "skills", "pi-upgrade-review"));
+  const skillText = readFileSync(join(skillDirectory, "SKILL.md"), "utf8");
+  assert.match(skillText, /^name: pi-upgrade-review$/m);
+  assert.match(skillText, /^disable-model-invocation: true$/m);
+  for (const reference of ["review-checklist.md", "report-template.md"]) {
+    assert.ok(existsSync(join(skillDirectory, "references", reference)), "skill references survive relocation");
+  }
   const paths = resources.extensions.filter((entry) => entry.enabled).map((entry) => entry.path).sort();
   assert.deepEqual(paths, expected, "Pi loads exactly the ten declared entries, excluding helpers and tests");
   const loaded = await discoverAndLoadExtensions(paths, cwd, agentDir);
@@ -88,7 +100,7 @@ try {
   cpSync(join(repository, "extensions"), join(relocated, "extensions"), { recursive: true });
   assert.deepEqual(readFileSync(config), before, "replacing the package tree leaves personal configuration intact");
   assert.equal(readConfigEnvFile().api_key, "test-personal");
-  console.log("Native package discovery, relocated loading, probe resource and persistent configuration passed");
+  console.log("Native extension/skill discovery, relocated loading, probe resource and persistent configuration passed");
 } finally {
   for (const [name, value] of environment) {
     if (value === undefined) delete process.env[name];
